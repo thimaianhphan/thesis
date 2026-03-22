@@ -1,0 +1,309 @@
+"""
+Training script for R2Gen + Knowledge Graph.
+
+Implements the two-stage training strategy from Zhang et al. (AAAI 2020):
+
+Stage 1 (optional, --kg_pretrain_epochs > 0):
+  - Train multi-label classifier to predict which KG nodes are present
+  - This teaches the visual extractor to recognize clinical findings
+  
+Stage 2 (main training):
+  - Train full report generation with KG integration
+  - Loss = L_CE + lambda * L_KG_align
+  - KG cross-attention in decoder provides clinical vocabulary guidance
+  - KG vocabulary bias boosts probability of clinical terms
+"""
+
+import torch
+import argparse
+import numpy as np
+from modules.tokenizers import Tokenizer
+from modules.dataloaders import R2DataLoader
+from modules.metrics import compute_scores
+from modules.optimizers import build_optimizer, build_lr_scheduler
+from modules.trainer import Trainer
+from modules.loss import compute_loss
+from models.r2gen_kg import R2GenKGModel
+
+
+def parse_agrs():
+    parser = argparse.ArgumentParser()
+
+    # ==================== Original R2Gen args ====================
+    # Data input settings
+    parser.add_argument('--image_dir', type=str, default='data/iu_xray/images/',
+                        help='the path to the directory containing the data.')
+    parser.add_argument('--ann_path', type=str, default='data/iu_xray/annotation.json',
+                        help='the path to the directory containing the data.')
+
+    # Data loader settings
+    parser.add_argument('--dataset_name', type=str, default='iu_xray',
+                        choices=['iu_xray', 'mimic_cxr'],
+                        help='the dataset to be used.')
+    parser.add_argument('--max_seq_length', type=int, default=60,
+                        help='the maximum sequence length of the reports.')
+    parser.add_argument('--threshold', type=int, default=3,
+                        help='the cut off frequency for the words.')
+    parser.add_argument('--num_workers', type=int, default=2,
+                        help='the number of workers for dataloader.')
+    parser.add_argument('--batch_size', type=int, default=16,
+                        help='the number of samples for a batch')
+
+    # Model settings (for visual extractor)
+    parser.add_argument('--visual_extractor', type=str, default='resnet101',
+                        help='the visual extractor to be used.')
+    parser.add_argument('--visual_extractor_pretrained', type=bool, default=True,
+                        help='whether to load the pretrained visual extractor')
+
+    # Model settings (for Transformer)
+    parser.add_argument('--d_model', type=int, default=512,
+                        help='the dimension of Transformer.')
+    parser.add_argument('--d_ff', type=int, default=512,
+                        help='the dimension of FFN.')
+    parser.add_argument('--d_vf', type=int, default=2048,
+                        help='the dimension of the patch features.')
+    parser.add_argument('--num_heads', type=int, default=8,
+                        help='the number of heads in Transformer.')
+    parser.add_argument('--num_layers', type=int, default=3,
+                        help='the number of layers of Transformer.')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='the dropout rate of Transformer.')
+    parser.add_argument('--logit_layers', type=int, default=1,
+                        help='the number of the logit layer.')
+    parser.add_argument('--bos_idx', type=int, default=0,
+                        help='the index of <bos>.')
+    parser.add_argument('--eos_idx', type=int, default=0,
+                        help='the index of <eos>.')
+    parser.add_argument('--pad_idx', type=int, default=0,
+                        help='the index of <pad>.')
+    parser.add_argument('--use_bn', type=int, default=0,
+                        help='whether to use batch normalization.')
+    parser.add_argument('--drop_prob_lm', type=float, default=0.5,
+                        help='the dropout rate of the output layer.')
+
+    # for Relational Memory
+    parser.add_argument('--rm_num_slots', type=int, default=3,
+                        help='the number of memory slots.')
+    parser.add_argument('--rm_num_heads', type=int, default=8,
+                        help='the number of heads in rm.')
+    parser.add_argument('--rm_d_model', type=int, default=512,
+                        help='the dimension of rm.')
+
+    # Sample related
+    parser.add_argument('--sample_method', type=str, default='beam_search',
+                        help='the sample methods to sample a report.')
+    parser.add_argument('--beam_size', type=int, default=3,
+                        help='the beam size when beam searching.')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='the temperature when sampling.')
+    parser.add_argument('--sample_n', type=int, default=1,
+                        help='the sample number per image.')
+    parser.add_argument('--group_size', type=int, default=1,
+                        help='the group size.')
+    parser.add_argument('--output_logsoftmax', type=int, default=1,
+                        help='whether to output the probabilities.')
+    parser.add_argument('--decoding_constraint', type=int, default=0,
+                        help='whether decoding constraint.')
+    parser.add_argument('--block_trigrams', type=int, default=1,
+                        help='whether to use block trigrams.')
+
+    # Trainer settings
+    parser.add_argument('--n_gpu', type=int, default=1,
+                        help='the number of gpus to be used.')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='the number of training epochs.')
+    parser.add_argument('--save_dir', type=str, default='results/iu_xray_kg',
+                        help='the path to save the models.')
+    parser.add_argument('--record_dir', type=str, default='records/',
+                        help='the path to save the results of experiments')
+    parser.add_argument('--save_period', type=int, default=1,
+                        help='the saving period.')
+    parser.add_argument('--monitor_mode', type=str, default='max',
+                        choices=['min', 'max'],
+                        help='whether to max or min the metric.')
+    parser.add_argument('--monitor_metric', type=str, default='BLEU_4',
+                        help='the metric to be monitored.')
+    parser.add_argument('--early_stop', type=int, default=50,
+                        help='the patience of training.')
+
+    # Optimization
+    parser.add_argument('--optim', type=str, default='Adam',
+                        help='the type of the optimizer.')
+    parser.add_argument('--lr_ve', type=float, default=5e-5,
+                        help='the learning rate for the visual extractor.')
+    parser.add_argument('--lr_ed', type=float, default=1e-4,
+                        help='the learning rate for the remaining parameters.')
+    parser.add_argument('--weight_decay', type=float, default=5e-5,
+                        help='the weight decay.')
+    parser.add_argument('--amsgrad', type=bool, default=True, help='.')
+
+    # Learning Rate Scheduler
+    parser.add_argument('--lr_scheduler', type=str, default='StepLR',
+                        help='the type of the learning rate scheduler.')
+    parser.add_argument('--step_size', type=int, default=50,
+                        help='the step size of the learning rate scheduler.')
+    parser.add_argument('--gamma', type=float, default=0.1,
+                        help='the gamma of the learning rate scheduler.')
+
+    # Others
+    parser.add_argument('--seed', type=int, default=9233, help='.')
+    parser.add_argument('--resume', type=str,
+                        help='whether to resume the training from existing checkpoints.')
+
+    # ==================== NEW: Knowledge Graph args ====================
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=2,
+                        help='Number of GCN layers for KG encoding. '
+                             'Ref: Zhang et al. (AAAI 2020) uses 2 layers.')
+    parser.add_argument('--kg_loss_weight', type=float, default=0.1,
+                        help='Weight for KG alignment loss (lambda). '
+                             'Ref: Zhang et al. (AAAI 2020) recommends 0.1-0.5.')
+    parser.add_argument('--kg_pretrain_epochs', type=int, default=10,
+                        help='Number of epochs for Stage 1 KG pretraining. '
+                             'Ref: Zhang et al. (AAAI 2020) two-stage training. '
+                             'Set to 0 to skip Stage 1.')
+    parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4,
+                        help='Learning rate for Stage 1 KG pretraining.')
+    parser.add_argument('--kg_co_occur_threshold', type=int, default=3,
+                        help='Minimum co-occurrence count for KG edges.')
+
+    args = parser.parse_args()
+    return args
+
+
+def build_kg_optimizer(args, model):
+    """Build optimizer with separate LR for KG components."""
+    ve_params = list(map(id, model.visual_extractor.parameters()))
+    kg_params = (list(map(id, model.encoder_decoder.kg_encoder.parameters())) +
+                 list(map(id, model.encoder_decoder.kg_vocab_bias.parameters())))
+    
+    ed_params = filter(
+        lambda x: id(x) not in ve_params and id(x) not in kg_params,
+        model.parameters()
+    )
+    kg_param_list = filter(
+        lambda x: id(x) in kg_params, model.parameters()
+    )
+    
+    optimizer = getattr(torch.optim, args.optim)(
+        [{'params': model.visual_extractor.parameters(), 'lr': args.lr_ve},
+         {'params': ed_params, 'lr': args.lr_ed},
+         {'params': kg_param_list, 'lr': args.lr_ed}],  # KG same LR as decoder
+        weight_decay=args.weight_decay,
+        amsgrad=args.amsgrad
+    )
+    return optimizer
+
+
+def pretrain_kg_classifier(model, train_dataloader, args, device):
+    """
+    Stage 1: Multi-label classification pretraining.
+    
+    Ref: Zhang et al. (AAAI 2020) — first train classifier to predict 
+    which KG nodes are present, then freeze and train report generator.
+    
+    This stage teaches the visual extractor to recognize clinical findings
+    before the main report generation training begins.
+    """
+    if args.kg_pretrain_epochs <= 0:
+        print("[KG Stage 1] Skipped (kg_pretrain_epochs=0)")
+        return
+    
+    print("=" * 60)
+    print("[KG Stage 1] Multi-label classification pretraining")
+    print(f"  Epochs: {args.kg_pretrain_epochs}")
+    print(f"  Ref: Zhang et al. (AAAI 2020) — two-stage training")
+    print("=" * 60)
+    
+    # Only train visual extractor + classifier
+    optimizer = torch.optim.Adam([
+        {'params': model.visual_extractor.parameters(), 'lr': args.lr_ve},
+        {'params': model.kg_classifier.parameters(), 'lr': args.kg_pretrain_lr},
+    ], weight_decay=args.weight_decay)
+    
+    # Get annotation for label extraction
+    import json
+    ann = json.loads(open(args.ann_path, 'r').read())
+    train_reports = {ex['id']: ex['report'] for ex in ann['train']}
+    
+    model.train()
+    for epoch in range(1, args.kg_pretrain_epochs + 1):
+        epoch_loss = 0
+        num_batches = 0
+        
+        for batch_idx, (images_id, images, reports_ids, reports_masks) in enumerate(train_dataloader):
+            images = images.to(device)
+            
+            # Get KG labels for this batch
+            batch_reports = [train_reports.get(iid, '') for iid in images_id]
+            kg_labels = model.encoder_decoder.get_kg_labels(batch_reports).to(device)
+            
+            # Forward through classifier
+            logits = model.classify_kg_nodes(images)
+            loss = model.kg_classifier.get_loss(logits, kg_labels)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(model.parameters(), 0.1)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            num_batches += 1
+        
+        avg_loss = epoch_loss / max(num_batches, 1)
+        print(f"[KG Stage 1] Epoch {epoch}/{args.kg_pretrain_epochs} — Loss: {avg_loss:.4f}")
+    
+    print("[KG Stage 1] Pretraining complete. Visual extractor now recognizes findings.")
+    print("=" * 60)
+
+
+def main():
+    # parse arguments
+    args = parse_agrs()
+
+    # fix random seeds
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(args.seed)
+
+    # create tokenizer
+    tokenizer = Tokenizer(args)
+
+    # create data loader
+    train_dataloader = R2DataLoader(args, tokenizer, split='train', shuffle=True)
+    val_dataloader = R2DataLoader(args, tokenizer, split='val', shuffle=False)
+    test_dataloader = R2DataLoader(args, tokenizer, split='test', shuffle=False)
+
+    # build KG-enhanced model
+    model = R2GenKGModel(args, tokenizer)
+    print(model)
+
+    # ==================== Stage 1: KG Pretraining ====================
+    device = torch.device('cuda:0' if args.n_gpu > 0 and torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    pretrain_kg_classifier(model, train_dataloader, args, device)
+    model = model.cpu()  # move back for Trainer to handle device placement
+
+    # ==================== Stage 2: Report Generation ====================
+    print("=" * 60)
+    print("[KG Stage 2] Full report generation training with KG")
+    print(f"  KG loss weight (lambda): {args.kg_loss_weight}")
+    print(f"  Ref: Adapted from Zhang (AAAI'20), PPKED (CVPR'21), KiUT (CVPR'23)")
+    print("=" * 60)
+
+    # get function handles of loss and metrics
+    criterion = compute_loss
+    metrics = compute_scores
+
+    # build optimizer with KG-aware parameter groups
+    optimizer = build_kg_optimizer(args, model)
+    lr_scheduler = build_lr_scheduler(args, optimizer)
+
+    # build trainer and start to train
+    trainer = Trainer(model, criterion, metrics, optimizer, args, lr_scheduler,
+                      train_dataloader, val_dataloader, test_dataloader)
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()
