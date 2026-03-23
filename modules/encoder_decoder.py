@@ -79,6 +79,7 @@ class EncoderLayer(nn.Module):
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
         return self.sublayer[1](x, self.feed_forward)
 
+
 class SublayerConnection(nn.Module):
     def __init__(self, d_model, dropout):
         super(SublayerConnection, self).__init__()
@@ -113,6 +114,7 @@ class Decoder(nn.Module):
             x = layer(x, hidden_states, src_mask, tgt_mask, memory)
         return self.norm(x)
 
+
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout, rm_num_slots, rm_d_model):
         super(DecoderLayer, self).__init__()
@@ -128,57 +130,6 @@ class DecoderLayer(nn.Module):
         x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask), memory)
         return self.sublayer[2](x, self.feed_forward, memory)
 
-class KGDecoder(nn.Module):
-    """Decoder with KG-aware layers."""
-    
-    def __init__(self, layer, N):
-        super(KGDecoder, self).__init__()
-        self.layers = clones(layer, N)
-        self.norm = LayerNorm(layer.d_model)
-        
-    def forward(self, x, hidden_states, src_mask, tgt_mask, memory, kg_feats=None):
-        for layer in self.layers:
-            x = layer(x, hidden_states, src_mask, tgt_mask, memory, kg_feats)
-        return self.norm(x)
-
-class KGDecoderLayer(nn.Module):
-    def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout, rm_num_slots, rm_d_model):
-        super(KGDecoderLayer, self).__init__()
-        self.d_model = d_model
-        self.self_attn = self_attn
-        self.src_attn = src_attn
-        self.feed_forward = feed_forward
-        self.sublayer = clones(
-            ConditionalSublayerConnection(d_model, dropout, rm_num_slots, rm_d_model), 3
-        )
-        
-        # NEW: KG cross-attention module (gated)
-        self.kg_cross_attn = KGCrossAttention(d_model, num_heads, dropout)
-        
-    def forward(self, x, hidden_states, src_mask, tgt_mask, memory, kg_feats=None):
-        """
-        Args:
-            x: Decoder input [B, L, D]
-            hidden_states: Encoder output [B, S, D]
-            src_mask: Source mask [B, 1, S]
-            tgt_mask: Target mask [B, L, L]
-            memory: Relational memory [B, rm_num_slots * rm_d_model]
-            kg_feats: KG node representations [N, D] (optional)
-        """
-        m = hidden_states
-        
-        # Sublayer 1: Self-attention with MCLN
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask), memory)
-        
-        # Sublayer 2: Source (visual) attention with MCLN
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask), memory)
-        
-        # Sublayer 2.5 (NEW): KG cross-attention
-        if kg_feats is not None:
-            x = self.kg_cross_attn(x, kg_feats)
-        
-        # Sublayer 3: Feed-forward with MCLN
-        return self.sublayer[2](x, self.feed_forward, memory)
 
 class ConditionalSublayerConnection(nn.Module):
     def __init__(self, d_model, dropout, rm_num_slots, rm_d_model):

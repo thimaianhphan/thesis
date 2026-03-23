@@ -151,16 +151,14 @@ def parse_agrs():
                         help='whether to resume the training from existing checkpoints.')
 
     # ==================== NEW: Knowledge Graph args ====================
-    parser.add_argument('--kg_num_gcn_layers', type=int, default=2,
-                        help='Number of GCN layers for KG encoding. '
-                             'Ref: Zhang et al. (AAAI 2020) uses 2 layers.')
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=1,
+                        help='Number of GCN layers (default: 1 to prevent over-smoothing).')
+    parser.add_argument('--kg_gcn_alpha', type=float, default=0.2,
+                        help='GCN residual weight (0.2 = mostly keep original embeddings).')
     parser.add_argument('--kg_loss_weight', type=float, default=0.1,
-                        help='Weight for KG alignment loss (lambda). '
-                             'Ref: Zhang et al. (AAAI 2020) recommends 0.1-0.5.')
+                        help='Weight for KG alignment loss (lambda).')
     parser.add_argument('--kg_pretrain_epochs', type=int, default=10,
-                        help='Number of epochs for Stage 1 KG pretraining. '
-                             'Ref: Zhang et al. (AAAI 2020) two-stage training. '
-                             'Set to 0 to skip Stage 1.')
+                        help='Epochs for Stage 1 KG pretraining (0 to skip).')
     parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4,
                         help='Learning rate for Stage 1 KG pretraining.')
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3,
@@ -172,22 +170,18 @@ def parse_agrs():
 
 def build_kg_optimizer(args, model):
     """Build optimizer with separate LR for KG components."""
-    ve_params = list(map(id, model.visual_extractor.parameters()))
-    kg_params = (list(map(id, model.encoder_decoder.kg_encoder.parameters())) +
-                 list(map(id, model.encoder_decoder.kg_vocab_bias.parameters())))
+    ve_params = set(map(id, model.visual_extractor.parameters()))
+    kg_params = set(map(id, model.encoder_decoder.kg_encoder.parameters()))
     
-    ed_params = filter(
-        lambda x: id(x) not in ve_params and id(x) not in kg_params,
-        model.parameters()
-    )
-    kg_param_list = filter(
-        lambda x: id(x) in kg_params, model.parameters()
-    )
+    ve_list = list(model.visual_extractor.parameters())
+    kg_list = [p for p in model.encoder_decoder.kg_encoder.parameters()]
+    ed_list = [p for p in model.parameters()
+               if id(p) not in ve_params and id(p) not in kg_params]
     
     optimizer = getattr(torch.optim, args.optim)(
-        [{'params': model.visual_extractor.parameters(), 'lr': args.lr_ve},
-         {'params': ed_params, 'lr': args.lr_ed},
-         {'params': kg_param_list, 'lr': args.lr_ed}],  # KG same LR as decoder
+        [{'params': ve_list, 'lr': args.lr_ve},
+         {'params': ed_list, 'lr': args.lr_ed},
+         {'params': kg_list, 'lr': args.lr_ed}],
         weight_decay=args.weight_decay,
         amsgrad=args.amsgrad
     )
