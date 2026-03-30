@@ -1,31 +1,16 @@
 """
-R2Gen + DCG-style Knowledge Graph Fusion
+R2Gen + Knowledge Graph + Contrastive Attention (v2+CA)
 
 Data flow:
-  Image → ResNet-101 (224×224) → att_feats [B, 98, 2048] → att_embed → [B, 98, 512]
-                                                                           ↓
-                                                                  R2Gen Encoder (self-attn)
-                                                                           ↓
-                                                                  encoder_out [B, 98, 512]
-                                                                           ↓
-  Entity text → distilGPT2 (offline) → [N, 768] → proj → [N, 512]         ↓
-                                                      ↓                    ↓
-                                              2-layer GCN(adj)             ↓
-                                                      ↓                    ↓
-                                              node_feats [N, 512]          ↓
-                                                      ↓                    ↓
-                                            DCG Bidirectional Cross-Attention:
-                                              i2g: Q=encoder_out, K/V=node_feats
-                                              g2i: Q=node_feats, K/V=encoder_out
-                                                      ↓
-                                              concat [B, N+98, 512]
-                                                      ↓
-                                      R2Gen Decoder (RM + MCLN, standard, unchanged)
-                                                      ↓
-                                              logits → report
+  Image → ResNet → fc_feats → KG Encoder (GCN + image gate) → kg_feats [B,N,D]
+                 → att_feats → [CA] → Transformer Encoder → encoder_out
+                                                                    ↓
+  Decoder: self_attn(+MCLN) → visual_cross_attn(+MCLN) → KG_cross_attn(gated) → FFN(+MCLN)
+                                                                    ↓
+                                                              logits → report
 
-Ref: DCG, Liang et al. "Divide and Conquer" (ACM MM 2024)
-Ref: R2Gen, Chen et al. (EMNLP 2020)
+KG fuses at DECODER level (KiUT-style), NOT encoder level.
+No DCG bidirectional cross-attention.
 """
 
 import torch
@@ -33,60 +18,80 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import copy
+import math
 
 from .visual_extractor import VisualExtractor
 from .encoder_decoder import (
-    Encoder, Decoder, EncoderLayer, DecoderLayer,
-    MultiHeadedAttention, PositionwiseFeedForward, PositionalEncoding,
-    Embeddings, RelationalMemory, LayerNorm, subsequent_mask
+    Encoder, EncoderLayer, MultiHeadedAttention, PositionwiseFeedForward,
+    PositionalEncoding, Embeddings, RelationalMemory,
+    ConditionalSublayerConnection, LayerNorm, clones, subsequent_mask
 )
 from .att_model import pack_wrapper, AttModel
 from .knowledge_graph import (
-    KnowledgeGraphBuilder, KnowledgeGraphEncoder, DCGFusion,
-    extract_node_features_gpt2,
+    KnowledgeGraphBuilder, KnowledgeGraphEncoder, KGCrossAttention,
+    KGMultiLabelClassifier, KGAlignmentLoss
 )
 from .contrastive_attention import ContrastiveAttention
 
 
 # =============================================================================
-# DCG-enhanced Transformer: Encoder → DCG Fusion → Standard Decoder
+# KG Decoder Layer: self-attn → visual cross-attn → KG cross-attn → FFN
 # =============================================================================
 
-class DCGTransformer(nn.Module):
-    """
-    R2Gen Transformer with DCG fusion between encoder and decoder.
-    Decoder is STANDARD R2Gen (DecoderLayer with RM + MCLN).
-    """
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, rm, dcg_fusion):
+class KGDecoderLayer(nn.Module):
+    def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout,
+                 rm_num_slots, rm_d_model, num_heads=8):
+        super().__init__()
+        self.d_model = d_model
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(
+            ConditionalSublayerConnection(d_model, dropout, rm_num_slots, rm_d_model), 3
+        )
+        # KG cross-attention uses 4 heads (not the main Transformer's 8)
+        self.kg_cross_attn = KGCrossAttention(d_model, num_heads=4, dropout=dropout)
+
+    def forward(self, x, hidden_states, src_mask, tgt_mask, memory, kg_feats=None):
+        m = hidden_states
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask), memory)
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask), memory)
+        if kg_feats is not None:
+            x = self.kg_cross_attn(x, kg_feats)
+        return self.sublayer[2](x, self.feed_forward, memory)
+
+
+class KGDecoder(nn.Module):
+    def __init__(self, layer, N):
+        super().__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.d_model)
+
+    def forward(self, x, hidden_states, src_mask, tgt_mask, memory, kg_feats=None):
+        for layer in self.layers:
+            x = layer(x, hidden_states, src_mask, tgt_mask, memory, kg_feats)
+        return self.norm(x)
+
+
+class KGTransformer(nn.Module):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, rm):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
         self.rm = rm
-        self.dcg_fusion = dcg_fusion
+
+    def forward(self, src, tgt, src_mask, tgt_mask, kg_feats=None):
+        return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask, kg_feats)
 
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
 
-    def fuse(self, encoder_out, kg_feats):
-        """DCG bidirectional cross-attention after encoder."""
-        return self.dcg_fusion(encoder_out, kg_feats)
-
-    def decode(self, fused_feats, fused_mask, tgt, tgt_mask):
-        """Standard R2Gen decode on fused features."""
-        memory = self.rm.init_memory(fused_feats.size(0)).to(fused_feats)
+    def decode(self, hidden_states, src_mask, tgt, tgt_mask, kg_feats=None):
+        memory = self.rm.init_memory(hidden_states.size(0)).to(hidden_states)
         memory = self.rm(self.tgt_embed(tgt), memory)
-        return self.decoder(
-            self.tgt_embed(tgt), fused_feats, fused_mask, tgt_mask, memory
-        )
-
-    def forward(self, src, tgt, src_mask, tgt_mask, kg_feats):
-        encoder_out = self.encode(src, src_mask)
-        fused = self.fuse(encoder_out, kg_feats)
-        B = fused.size(0)
-        fused_mask = fused.new_ones(B, 1, fused.size(1)).long()
-        return self.decode(fused, fused_mask, tgt, tgt_mask)
+        return self.decoder(self.tgt_embed(tgt), hidden_states, src_mask, tgt_mask, memory, kg_feats)
 
 
 # =============================================================================
@@ -104,21 +109,16 @@ class KGEncoderDecoder(AttModel):
             num_slots=self.rm_num_slots, d_model=self.rm_d_model,
             num_heads=self.rm_num_heads
         )
-        dcg_fusion = DCGFusion(
-            self.d_model, num_heads=self.num_heads, dropout=self.dropout
-        )
-        # Standard R2Gen decoder — NO modifications
-        model = DCGTransformer(
+        model = KGTransformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
-            Decoder(
-                DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout,
-                             self.rm_num_slots, self.rm_d_model),
+            KGDecoder(
+                KGDecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout,
+                               self.rm_num_slots, self.rm_d_model, self.num_heads),
                 self.num_layers
             ),
             lambda x: x,
             nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position)),
-            rm,
-            dcg_fusion
+            rm
         )
         for p in model.parameters():
             if p.dim() > 1:
@@ -145,7 +145,6 @@ class KGEncoderDecoder(AttModel):
             co_occur_threshold=getattr(args, 'kg_co_occur_threshold', 3),
         )
         node_list, node_types, adjacency, node2idx = kg_builder.build(split='train')
-
         self.node_list = node_list
         self.node_types = node_types
         self.node2idx = node2idx
@@ -153,25 +152,19 @@ class KGEncoderDecoder(AttModel):
         self.num_kg_nodes = len(node_list)
         self.register_buffer('adj', torch.FloatTensor(adjacency))
 
-        # Extract node features with distilGPT2 (offline, cached)
-        cache_dir = os.path.dirname(args.ann_path) if hasattr(args, 'ann_path') else '.'
-        cache_path = os.path.join(cache_dir, f'node_features_gpt2_{args.dataset_name}.pt')
-        node_feat_init = extract_node_features_gpt2(
-            node_list, cache_path=cache_path, device='cpu'
-        )
+        d_visual = args.d_vf * (2 if args.dataset_name == 'iu_xray' else 1)
 
-        # KG encoder: 2-layer GCN with distilGPT2 init
         self.kg_encoder = KnowledgeGraphEncoder(
-            num_nodes=self.num_kg_nodes,
-            node_types=node_types,
-            d_model=args.d_model,
-            node_feat_init=node_feat_init,
-            gcn_hidden=getattr(args, 'kg_gcn_hidden', 128),
+            num_nodes=self.num_kg_nodes, node_types=node_types,
+            d_model=args.d_model, d_visual=d_visual,
+            num_gcn_layers=getattr(args, 'kg_num_gcn_layers', 1),
             dropout=args.dropout,
+            gcn_residual_alpha=getattr(args, 'kg_gcn_alpha', 0.2),
         )
 
         self.model = self.make_model(tgt_vocab)
         self.logit = nn.Linear(args.d_model, tgt_vocab)
+        self.kg_loss_weight = getattr(args, 'kg_loss_weight', 0.1)
 
         # Contrastive Attention (optional)
         use_ca = getattr(args, 'use_contrastive_attention', False)
@@ -189,24 +182,11 @@ class KGEncoderDecoder(AttModel):
         return []
 
     def _prepare_feature(self, fc_feats, att_feats, att_masks):
-        """Inference: encode → fuse → cache for decoder."""
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks)
-
         if self.contrastive_attn is not None:
             att_feats = self.contrastive_attn(att_feats, self._cached_fc_feats)
-
-        encoder_out = self.model.encode(att_feats, att_masks)
-
-        # GCN (no image conditioning — DCG style)
-        kg_feats = self.kg_encoder(self.adj)  # [N, D]
-        B = encoder_out.size(0)
-        kg_feats = kg_feats.unsqueeze(0).expand(B, -1, -1)  # [B, N, D]
-
-        # DCG fusion
-        fused = self.model.fuse(encoder_out, kg_feats)  # [B, N+S, D]
-        fused_mask = fused.new_ones(B, 1, fused.size(1)).long()
-
-        return fc_feats[..., :1], att_feats[..., :1], fused, fused_mask
+        memory = self.model.encode(att_feats, att_masks)
+        return fc_feats[..., :1], att_feats[..., :1], memory, att_masks
 
     def _prepare_feature_forward(self, att_feats, att_masks=None, seq=None):
         att_feats, att_masks = self.clip_att(att_feats, att_masks)
@@ -225,31 +205,31 @@ class KGEncoderDecoder(AttModel):
         return att_feats, seq, att_masks, seq_mask
 
     def _forward(self, fc_feats, att_feats, seq, att_masks=None):
-        """Training forward."""
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks, seq)
-
         if self.contrastive_attn is not None:
             att_feats = self.contrastive_attn(att_feats, fc_feats)
-
-        # GCN (no image conditioning)
-        kg_feats = self.kg_encoder(self.adj)  # [N, D]
-        B = att_feats.size(0)
-        kg_feats = kg_feats.unsqueeze(0).expand(B, -1, -1)  # [B, N, D]
-
+        kg_feats = self.kg_encoder(self.adj, fc_feats)
         out = self.model(att_feats, seq, att_masks, seq_mask, kg_feats)
         outputs = F.log_softmax(self.logit(out), dim=-1)
         return outputs
 
     def core(self, it, fc_feats_ph, att_feats_ph, memory, state, mask):
-        """Inference step — memory is fused features from _prepare_feature."""
         if len(state) == 0:
             ys = it.unsqueeze(1)
+            self._cached_kg_feats = self.kg_encoder(self.adj, self._cached_fc_feats)
         else:
             ys = torch.cat([state[0][0], it.unsqueeze(1)], dim=1)
-
+        # Beam search batch expansion fix
+        kg = self._cached_kg_feats
+        if kg.size(0) != memory.size(0):
+            beam = memory.size(0) // kg.size(0)
+            kg = kg.unsqueeze(1).expand(-1, beam, -1, -1).reshape(
+                memory.size(0), kg.size(1), kg.size(2))
+            self._cached_kg_feats = kg
         out = self.model.decode(
             memory, mask, ys,
-            subsequent_mask(ys.size(1)).to(memory.device)
+            subsequent_mask(ys.size(1)).to(memory.device),
+            self._cached_kg_feats
         )
         return out[:, -1], [ys.unsqueeze(0)]
 

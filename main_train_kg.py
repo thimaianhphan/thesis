@@ -150,13 +150,17 @@ def parse_agrs():
     parser.add_argument('--resume', type=str,
                         help='whether to resume the training from existing checkpoints.')
 
-    # ==================== Knowledge Graph args (DCG-style) ====================
-    parser.add_argument('--kg_num_gcn_layers', type=int, default=2,
-                        help='Number of GCN layers (DCG uses 2).')
-    parser.add_argument('--kg_gcn_hidden', type=int, default=128,
-                        help='GCN hidden dimension (DCG uses 128).')
+    # ==================== Knowledge Graph args ====================
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=1,
+                        help='Number of GCN layers (1 to prevent over-smoothing).')
     parser.add_argument('--kg_gcn_alpha', type=float, default=0.2,
-                        help='GCN residual weight (not used in DCG 2-layer).')
+                        help='GCN residual weight (0.2 = mostly keep original embeddings).')
+    parser.add_argument('--kg_loss_weight', type=float, default=0.1,
+                        help='Weight for KG alignment loss.')
+    parser.add_argument('--kg_pretrain_epochs', type=int, default=10,
+                        help='Epochs for Stage 1 KG pretraining (0 to skip).')
+    parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4,
+                        help='Learning rate for Stage 1 KG pretraining.')
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3,
                         help='Minimum co-occurrence count for KG edges.')
 
@@ -314,10 +318,17 @@ def main():
 
     model = model.cpu()
 
-    # ==================== Report Generation Training ====================
+    # ==================== Stage 1: KG Pretraining ====================
+    device2 = torch.device('cuda:0' if args.n_gpu > 0 and torch.cuda.is_available() else 'cpu')
+    model = model.to(device2)
+    pretrain_kg_classifier(model, train_dataloader, args, device2)
+    model = model.cpu()
+
+    # ==================== Stage 2: Report Generation ====================
     print("=" * 60)
-    print("[DCG] Report generation training with DCG-style KG fusion")
-    print(f"  Ref: DCG (ACM MM'24), R2Gen (EMNLP'20)")
+    print("[KG Stage 2] Report generation training with KG")
+    print(f"  KG loss weight: {args.kg_loss_weight}")
+    print(f"  Ref: Zhang (AAAI'20), PPKED (CVPR'21), KiUT (CVPR'23)")
     print("=" * 60)
 
     # get function handles of loss and metrics
