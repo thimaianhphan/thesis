@@ -150,38 +150,57 @@ def parse_agrs():
     parser.add_argument('--resume', type=str,
                         help='whether to resume the training from existing checkpoints.')
 
-    # ==================== NEW: Knowledge Graph args ====================
-    parser.add_argument('--kg_num_gcn_layers', type=int, default=1,
-                        help='Number of GCN layers (default: 1 to prevent over-smoothing).')
+    # ==================== Knowledge Graph args (DCG-style) ====================
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=2,
+                        help='Number of GCN layers (DCG uses 2).')
+    parser.add_argument('--kg_gcn_hidden', type=int, default=128,
+                        help='GCN hidden dimension (DCG uses 128).')
     parser.add_argument('--kg_gcn_alpha', type=float, default=0.2,
-                        help='GCN residual weight (0.2 = mostly keep original embeddings).')
-    parser.add_argument('--kg_loss_weight', type=float, default=0.1,
-                        help='Weight for KG alignment loss (lambda).')
-    parser.add_argument('--kg_pretrain_epochs', type=int, default=10,
-                        help='Epochs for Stage 1 KG pretraining (0 to skip).')
-    parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4,
-                        help='Learning rate for Stage 1 KG pretraining.')
+                        help='GCN residual weight (not used in DCG 2-layer).')
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3,
                         help='Minimum co-occurrence count for KG edges.')
+
+    # ==================== Contrastive Attention args ====================
+    # Ref: Liu et al. "Contrastive Attention" (ACL Findings 2021)
+    parser.add_argument('--use_contrastive_attention', action='store_true',
+                        help='Enable Contrastive Attention module.')
+    parser.add_argument('--ca_pool_size', type=int, default=100,
+                        help='Number of normal images in normality pool. '
+                             '100 for IU X-Ray, 500-1000 for MIMIC-CXR.')
+    parser.add_argument('--ca_num_rounds', type=int, default=3,
+                        help='Number of Aggregate Attention rounds (paper uses 3).')
 
     args = parser.parse_args()
     return args
 
 
 def build_kg_optimizer(args, model):
-    """Build optimizer with separate LR for KG components."""
+    """Build optimizer with separate LR for KG and CA components."""
     ve_params = set(map(id, model.visual_extractor.parameters()))
     kg_params = set(map(id, model.encoder_decoder.kg_encoder.parameters()))
-    
+
+    # CA params (if enabled)
+    ca_params = set()
+    if model.encoder_decoder.contrastive_attn is not None:
+        ca_params = set(map(id, model.encoder_decoder.contrastive_attn.parameters()))
+
+    special_params = ve_params | kg_params | ca_params
+
     ve_list = list(model.visual_extractor.parameters())
-    kg_list = [p for p in model.encoder_decoder.kg_encoder.parameters()]
-    ed_list = [p for p in model.parameters()
-               if id(p) not in ve_params and id(p) not in kg_params]
-    
+    kg_list = list(model.encoder_decoder.kg_encoder.parameters())
+    ca_list = list(model.encoder_decoder.contrastive_attn.parameters()) if model.encoder_decoder.contrastive_attn else []
+    ed_list = [p for p in model.parameters() if id(p) not in special_params]
+
+    param_groups = [
+        {'params': ve_list, 'lr': args.lr_ve},
+        {'params': ed_list, 'lr': args.lr_ed},
+        {'params': kg_list, 'lr': args.lr_ed},
+    ]
+    if ca_list:
+        param_groups.append({'params': ca_list, 'lr': args.lr_ed})
+
     optimizer = getattr(torch.optim, args.optim)(
-        [{'params': ve_list, 'lr': args.lr_ve},
-         {'params': ed_list, 'lr': args.lr_ed},
-         {'params': kg_list, 'lr': args.lr_ed}],
+        param_groups,
         weight_decay=args.weight_decay,
         amsgrad=args.amsgrad
     )
@@ -272,17 +291,33 @@ def main():
     model = R2GenKGModel(args, tokenizer)
     print(model)
 
-    # ==================== Stage 1: KG Pretraining ====================
+    # ==================== Build Contrastive Attention pool ====================
     device = torch.device('cuda:0' if args.n_gpu > 0 and torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-    pretrain_kg_classifier(model, train_dataloader, args, device)
-    model = model.cpu()  # move back for Trainer to handle device placement
 
-    # ==================== Stage 2: Report Generation ====================
+    if getattr(args, 'use_contrastive_attention', False):
+        ca = model.encoder_decoder.contrastive_attn
+        if ca is not None:
+            print("=" * 60)
+            print("[CA] Building normality pool from training data")
+            print(f"  Pool size: {args.ca_pool_size}")
+            print(f"  Aggregate Attention rounds: {args.ca_num_rounds}")
+            print(f"  Ref: Liu et al. (ACL Findings 2021)")
+            print("=" * 60)
+            ca.build_normality_pool(
+                visual_extractor=model.visual_extractor,
+                dataloader=train_dataloader,
+                dataset_name=args.dataset_name,
+                ann_path=args.ann_path,
+                device=device,
+            )
+
+    model = model.cpu()
+
+    # ==================== Report Generation Training ====================
     print("=" * 60)
-    print("[KG Stage 2] Full report generation training with KG")
-    print(f"  KG loss weight (lambda): {args.kg_loss_weight}")
-    print(f"  Ref: Adapted from Zhang (AAAI'20), PPKED (CVPR'21), KiUT (CVPR'23)")
+    print("[DCG] Report generation training with DCG-style KG fusion")
+    print(f"  Ref: DCG (ACM MM'24), R2Gen (EMNLP'20)")
     print("=" * 60)
 
     # get function handles of loss and metrics

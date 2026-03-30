@@ -156,14 +156,16 @@ def parse_agrs():
                         help='Path to the trained model checkpoint.')
 
     # KG args (must match training config)
-    parser.add_argument('--kg_num_gcn_layers', type=int, default=1,
-                        help='Number of GCN layers (must match training).')
-    parser.add_argument('--kg_gcn_alpha', type=float, default=0.2,
-                        help='GCN residual weight (must match training).')
-    parser.add_argument('--kg_loss_weight', type=float, default=0.1, help='.')
-    parser.add_argument('--kg_pretrain_epochs', type=int, default=0, help='.')
-    parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4, help='.')
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=2, help='.')
+    parser.add_argument('--kg_gcn_hidden', type=int, default=128, help='.')
+    parser.add_argument('--kg_gcn_alpha', type=float, default=0.2, help='.')
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3, help='.')
+
+    # Contrastive Attention args
+    parser.add_argument('--use_contrastive_attention', action='store_true',
+                        help='Enable Contrastive Attention.')
+    parser.add_argument('--ca_pool_size', type=int, default=100, help='.')
+    parser.add_argument('--ca_num_rounds', type=int, default=3, help='.')
 
     args = parser.parse_args()
     return args
@@ -201,7 +203,6 @@ def extract_clinical_entities(text):
             elif canonical in normal_words:
                 found_normal.add(canonical)
 
-    # Check bigrams
     for i in range(len(words) - 1):
         bigram = words[i] + ' ' + words[i + 1]
         finding_words = FINDING_ENTITIES['abnormal'] + FINDING_ENTITIES['normal']
@@ -460,6 +461,22 @@ def main():
 
     # build KG-enhanced model
     model = R2GenKGModel(args, tokenizer)
+
+    # Build CA normality pool if enabled (needs training dataloader)
+    if getattr(args, 'use_contrastive_attention', False):
+        ca = model.encoder_decoder.contrastive_attn
+        if ca is not None:
+            train_dataloader = R2DataLoader(args, tokenizer, split='train', shuffle=False)
+            device = torch.device('cuda:0' if args.n_gpu > 0 and torch.cuda.is_available() else 'cpu')
+            model = model.to(device)
+            ca.build_normality_pool(
+                visual_extractor=model.visual_extractor,
+                dataloader=train_dataloader,
+                dataset_name=args.dataset_name,
+                ann_path=args.ann_path,
+                device=device,
+            )
+            model = model.cpu()
 
     # get function handles of loss and metrics
     criterion = compute_loss
