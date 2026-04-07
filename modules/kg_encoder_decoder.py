@@ -171,6 +171,7 @@ class KGEncoderDecoder(AttModel):
         if use_ca:
             self.contrastive_attn = ContrastiveAttention(
                 d_model=args.d_model,
+                d_fc = d_visual,
                 pool_size=getattr(args, 'ca_pool_size', 100),
                 num_agg_rounds=getattr(args, 'ca_num_rounds', 3),
                 dropout=args.dropout,
