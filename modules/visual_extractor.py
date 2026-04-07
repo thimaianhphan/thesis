@@ -33,100 +33,105 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SamModel, SamProcessor
-
-
+ 
+ 
 MEDSAM_HF_ID = "wanglab/medsam-vit-base"
-
-# Output dim of MedSAM neck (always 256 for ViT-B variant)
 MEDSAM_D_VF = 256
-
-
+ 
+ 
 class MedSAMVisualExtractor(nn.Module):
     """
     Visual feature extractor based on MedSAM's ViT-B image encoder.
-
-    Returns:
-        att_feats : [B, 4096, 256]  — spatial patch features (64×64 grid)
-        fc_feats  : [B, 256]        — global average-pooled feature
+ 
+    Calls vision_encoder DIRECTLY — bypasses get_image_embeddings() which
+    enforces a 1024×1024 size check via SamProcessor. This lets us run at
+    any resolution (224×224 default) without modification.
+ 
+    MedSAM vision_encoder internals:
+      patch_embed : Conv2d(3, 768, kernel=16, stride=16)
+                    At 224×224 → (224/16)² = 196 patches  [B, 196, 768]
+                    At 1024×1024 → 4096 patches            [B, 4096, 768]
+      transformer : 12 ViT-B layers                        [B, P, 768]
+      neck        : Conv2d 768→256 + LayerNorm             [B, 256, H/16, W/16]
+ 
+    At 224×224:
+      att_feats : [B, 196, 256]   (14×14 grid)
+      fc_feats  : [B, 256]
+ 
+    At 1024×1024:
+      att_feats : [B, 4096, 256]  (64×64 grid)
+      fc_feats  : [B, 256]
+ 
+    d_vf = 256 in both cases. Set args.d_vf = 256.
     """
-
+ 
     def __init__(self, args):
         super().__init__()
         self.args = args
-        # Image size used for resizing before feeding MedSAM
         self.image_size = getattr(args, 'image_size', 224)
-
+ 
         pretrained = getattr(args, 'visual_extractor_pretrained', True)
         print(f"[MedSAM] Loading {MEDSAM_HF_ID} (pretrained={pretrained})...")
-
+ 
         full_model = SamModel.from_pretrained(MEDSAM_HF_ID)
-        # We only need the vision encoder — discard prompt/mask decoder
+ 
+        # Extract only the vision encoder (ViT + neck).
+        # Discard prompt_encoder and mask_decoder — saves ~200MB.
         self.vision_encoder = full_model.vision_encoder
-        self.neck = full_model.vision_encoder  # neck is integrated in SAM's encoder
-
-        # Actually for transformers SamModel the structure is:
-        #   model.vision_encoder  → SamVisionEncoder (ViT + neck)
-        #   output.last_hidden_state  → [B, 64*64, 768] (before neck)
-        #   but we want post-neck [B, 256, 64, 64]
-        # The cleanest way is to call the full image_encoder path:
-        self.sam = full_model
-        # Delete the parts we don't need to save memory
-        del self.sam.prompt_encoder
-        del self.sam.mask_decoder
-
+        del full_model
+ 
         if not pretrained:
-            self.sam.vision_encoder.apply(self._init_weights)
-
-        # Optionally freeze the backbone and only fine-tune a projection
-        if getattr(args, 'freeze_visual_extractor', False):
-            for p in self.sam.vision_encoder.parameters():
+            self.vision_encoder.apply(self._init_weights)
+ 
+        frozen = getattr(args, 'freeze_visual_extractor', False)
+        if frozen:
+            for p in self.vision_encoder.parameters():
                 p.requires_grad_(False)
             print("[MedSAM] Backbone frozen.")
         else:
-            print("[MedSAM] Backbone trainable (full fine-tune).")
-
-        print(f"[MedSAM] Ready. d_vf={MEDSAM_D_VF}, image_size={self.image_size}")
-
+            print("[MedSAM] Backbone trainable.")
+ 
+        print(f"[MedSAM] Ready. image_size={self.image_size}, d_vf={MEDSAM_D_VF}")
+ 
     @staticmethod
     def _init_weights(m):
         if isinstance(m, (nn.Linear, nn.Conv2d)):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0.)
-
+ 
     def forward(self, images):
         """
         Args:
-            images: [B, 3, H, W]  — pixel values, normalised to [0,1] or [-1,1]
-                    Will be resized to self.image_size × self.image_size.
-
+            images : [B, 3, H, W]  any resolution; resized internally if needed.
+ 
         Returns:
-            att_feats : [B, 4096, 256]
+            att_feats : [B, N_patches, 256]  e.g. [B, 196, 256] at 224×224
             fc_feats  : [B, 256]
         """
-        B = images.size(0)
-
-        # Resize to MedSAM's expected input size
-        if images.shape[-1] != self.image_size or images.shape[-2] != self.image_size:
+        # Resize if necessary — purely in-model, no processor involved
+        if images.shape[-2] != self.image_size or images.shape[-1] != self.image_size:
             images = F.interpolate(
                 images,
                 size=(self.image_size, self.image_size),
                 mode='bilinear',
-                align_corners=False
+                align_corners=False,
             )
-
-        # MedSAM's SamModel.get_image_embeddings expects pixel_values
-        # Output: [B, 256, 64, 64]
-        with torch.set_grad_enabled(self.training and
-                                    not getattr(self.args, 'freeze_visual_extractor', False)):
-            image_embeddings = self.sam.get_image_embeddings(pixel_values=images)
-
-        # [B, 256, 64, 64] → att_feats [B, 4096, 256]
-        att_feats = image_embeddings.flatten(2).transpose(1, 2)  # [B, 4096, 256]
-
+ 
+        frozen = getattr(self.args, 'freeze_visual_extractor', False)
+        with torch.set_grad_enabled(self.training and not frozen):
+            # Call vision_encoder directly — no size validation, no processor.
+            # Returns a BaseModelOutput; last_hidden_state is post-neck [B, 256, H/16, W/16]
+            encoder_out = self.vision_encoder(pixel_values=images)
+            # post-neck shape: [B, 256, image_size//16, image_size//16]
+            feat_map = encoder_out.last_hidden_state   # [B, 256, h, w]
+ 
+        # att_feats: flatten spatial dims → [B, h*w, 256]
+        att_feats = feat_map.flatten(2).transpose(1, 2)   # [B, N, 256]
+ 
         # fc_feats: global average pool → [B, 256]
-        fc_feats = image_embeddings.mean(dim=(2, 3))             # [B, 256]
-
+        fc_feats = feat_map.mean(dim=(2, 3))              # [B, 256]
+ 
         return att_feats, fc_feats
 
 class ResNetVisualExtractor(nn.Module):
