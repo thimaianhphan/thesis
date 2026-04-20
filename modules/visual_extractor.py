@@ -137,7 +137,7 @@ class MedSAMVisualExtractor(nn.Module):
 
 class ResNetVisualExtractor(nn.Module):
     def __init__(self, args):
-        super(VisualExtractor, self).__init__()
+        super(ResNetVisualExtractor, self).__init__()
         self.visual_extractor = args.visual_extractor
         self.pretrained = args.visual_extractor_pretrained
         model = getattr(models, self.visual_extractor)(pretrained=self.pretrained)
