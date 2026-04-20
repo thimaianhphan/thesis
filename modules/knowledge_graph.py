@@ -1,16 +1,23 @@
 """
-Knowledge Graph Module for R2Gen — v4: Fixed BiomedCLIP node discovery
+Knowledge Graph Module for R2Gen — v5: Revision 2 unigram-first node discovery
 
-Fixes applied:
-  - Fix 2a: Multi-example prototype anchors (replaces single-string _ANCHOR_PHRASES)
-  - Fix 2b: Confidence threshold 0.6 — ambiguous terms dropped entirely
-  - Fix 2c: Noun-biased bigram/trigram/unigram candidate extraction
-  - Fix 2d: Synonym clustering via BiomedCLIP cosine > 0.92
-  - Fix 2e: max_nodes=40, no forced 40/40/20 category balance
-  - Fix 3:  Three-layer label extraction (synonym map + stemming + proximity)
+Changes from v4 (Revision 1):
+  - Fix 2a: Unigram-first extraction; bigrams only if freq >= 30 reports, cap 10
+  - Fix 2b: Aggressively expanded stopword set (modifiers, filler, position words)
+  - Fix 2c: Revised anchors — bare nouns for anatomy, state-verb for normal
+  - Fix 2d: Per-category confidence thresholds (anatomy=0.50, abnormal=0.55, normal=0.55)
+  - Fix 2e: Morphological synonym map replaces BiomedCLIP cosine clustering
+  - Fix 2f: Whitelist backfill for terms BiomedCLIP reliably mis-types
+  - Fix 2g: max_nodes=80, no forced category balance
+  - Fix 3:  Simplified label extraction — exact stem (unigram) or consecutive (bigram)
 
-NOTE: Checkpoints from prior runs (130+ node graphs) are incompatible —
-      retrain from scratch after this change.
+Kept from v4:
+  - Fix 1 (KGCrossAttention with gated residual) — unchanged
+  - Fix 4 integration checks — unchanged
+  - BiomedCLIP text encoder — unchanged
+  - GraphConvolution, KnowledgeGraphEncoder, KGMultiLabelClassifier — unchanged
+
+NOTE: Checkpoints from prior runs are incompatible — retrain from scratch.
 """
 
 import json
@@ -96,36 +103,44 @@ def biomedclip_encode_text(phrases, device='cpu', batch_size=64):
     return torch.cat(all_embs, dim=0)   # [N, 512]
 
 
-# Fix 2a: Multi-example prototype anchors
+# Fix 2c: Revised anchors — bare nouns for anatomy, state-verb anchors for normal
 _ANCHOR_EXAMPLES = {
     'anatomy': [
-        "the lungs and pleura are visualized",
-        "the cardiac silhouette and mediastinum",
-        "normal heart size and pulmonary vasculature",
-        "the thoracic skeleton and soft tissues",
+        "lung", "lungs", "heart", "cardiac", "pleura", "pleural",
+        "diaphragm", "ribs", "mediastinum", "trachea", "aorta",
+        "thoracic spine", "hilum", "costophrenic angle",
     ],
     'abnormal': [
         "there is a pleural effusion",
-        "bilateral patchy opacity consistent with pneumonia",
-        "enlarged cardiac silhouette with pulmonary edema",
-        "focal consolidation in the lower lobe",
-        "a large pneumothorax is present",
+        "opacity in the lower lobe",
+        "enlarged cardiac silhouette",
+        "patchy consolidation",
+        "a nodule is present",
+        "pneumothorax with mediastinal shift",
+        "fracture of the rib",
+        "cardiomegaly",
     ],
     'normal': [
-        "lungs are well expanded and clear",
-        "no focal consolidation effusion or pneumothorax",
+        "lungs are clear",
+        "no focal consolidation",
+        "heart size is normal",
+        "unremarkable",
+        "within normal limits",
         "no acute cardiopulmonary abnormality",
-        "heart size and mediastinal contours are normal",
+        "stable appearance",
     ],
 }
 
+# Per-category confidence thresholds (Fix 2d)
+_CONF_THRESHOLD = {
+    'anatomy': 0.50,
+    'abnormal': 0.55,
+    'normal': 0.55,
+}
 
-# =============================================================================
-# 2. Candidate extraction helpers
-# =============================================================================
-
-# Fix 2c: Extended stopwords (added radiological noise words)
+# Fix 2b: Aggressively expanded stopword set
 _STOPWORDS = {
+    # articles, pronouns, conjunctions, prepositions
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
     'should', 'may', 'might', 'shall', 'can', 'of', 'in', 'on', 'at',
@@ -137,45 +152,63 @@ _STOPWORDS = {
     'about', 'above', 'after', 'again', 'against', 'all', 'any',
     'because', 'before', 'between', 'further', 'here', 'its', 'only',
     'our', 'own', 'same', 'their', 'them', 'they', 'we', 'your',
-    'without', 'note', 'patient', 'exam', 'image', 'images', 'view',
-    'views', 'radiograph', 'radiographs', 'chest', 'comparison',
-    'change', 'new', 'old', 'prior', 'now', 'interval', 'since',
-    'previously', 'however', 'well', 'including',
-    # Added noise words (Fix 2c)
-    'noted', 'seen', 'evidence', 'suggestion', 'suspicious', 'appearance',
-    'findings', 'impression', 'bony', 'soft', 'tissue', 'structures',
-    'consistent', 'similar', 'unchanged', 'stable', 'xxxx',
+    'without', 'note', 'exam', 'radiograph', 'radiographs',
+    'change', 'new', 'old', 'now', 'interval', 'previously', 'however',
+    'well', 'including', 'xxxx',
+    # radiology reporting filler
+    'image', 'images', 'view', 'views', 'study', 'examination',
+    'patient', 'finding', 'findings', 'impression', 'comparison',
+    'technique', 'history', 'indication', 'report',
+    # vague qualifiers (not clinical content)
+    'noted', 'seen', 'visible', 'visualized', 'identified', 'present',
+    'appearance', 'appears', 'demonstrate', 'demonstrates', 'shows',
+    'showing', 'reveals', 'suggests', 'suggestion', 'suspicious',
+    'possibly', 'probably', 'likely', 'grossly', 'overall',
+    'consistent', 'similar', 'unchanged', 'evidence',
+    # modifiers that must NOT become KG nodes (caused mild→normal bug)
+    'mild', 'moderate', 'severe', 'small', 'large', 'significant',
+    'minimal', 'marked', 'subtle', 'prominent', 'patchy', 'dense',
+    'focal', 'diffuse',
+    # position/laterality (too generic for KG typing)
+    'left', 'right', 'bilateral', 'unilateral', 'upper', 'lower',
+    'anterior', 'posterior', 'lateral', 'medial', 'inferior', 'superior',
+    # temporal/measurement filler
+    'prior', 'previous', 'current', 'today', 'since', 'acute', 'chronic',
+    # structure words that embed badly as isolated tokens
+    'soft', 'tissue', 'structures', 'bony',
 }
 
-_MODIFIERS = {
-    'small', 'large', 'mild', 'severe', 'bilateral', 'acute', 'chronic',
-    'focal', 'diffuse', 'upper', 'lower', 'left', 'right', 'minimal',
-    'moderate', 'marked', 'subtle', 'prominent', 'patchy', 'dense',
+# Fix 2f: Backfill whitelists — force correct type if present at freq >= 50
+_ANATOMY_BACKFILL = {
+    'lung', 'heart', 'pleural', 'diaphragm', 'rib', 'mediastinum',
+    'cardiac', 'thoracic', 'pulmonary', 'aorta', 'hilum',
+    'vasculature', 'silhouette',
 }
 
+_NORMAL_BACKFILL = {
+    'normal', 'clear', 'unremarkable', 'stable', 'intact', 'preserved',
+    'symmetric', 'midline', 'satisfactory', 'adequate', 'appropriate',
+    'negative', 'free',
+}
 
-def _is_likely_noun(word):
-    """Length > 3, not stopword, not adjective/adverb suffix."""
-    return (len(word) > 3 and word not in _STOPWORDS
-            and not word.endswith(('ly', 'ed', 'ing')))
+_ABNORMAL_BACKFILL = {
+    'cardiomegaly', 'pneumothorax', 'atelectasis', 'edema',
+    'effusion', 'consolidation', 'opacity', 'infiltrate',
+    'pneumonia', 'nodule', 'mass', 'fracture',
+}
 
-
-def _is_modifier(word):
-    """Known modifier or adjectival suffix."""
-    return (word in _MODIFIERS
-            or word.endswith(('al', 'ic', 'ive', 'ar'))
-            or (word not in _STOPWORDS and len(word) <= 5))
+_BACKFILL_FREQ_MIN = 50
 
 
 # =============================================================================
-# 3. KnowledgeGraphBuilder
+# 2. KnowledgeGraphBuilder
 # =============================================================================
 
 class KnowledgeGraphBuilder:
     def __init__(self, ann_path, dataset_name='iu_xray',
                  co_occur_threshold=3,
                  min_term_freq=5,
-                 max_nodes=40,          # Fix 2e: was 150
+                 max_nodes=80,
                  biomedclip_device='cpu'):
         self.ann_path           = ann_path
         self.dataset_name       = dataset_name
@@ -186,8 +219,8 @@ class KnowledgeGraphBuilder:
 
         self._node_list  = None
         self._node2idx   = None
-        self.synonym_map = {}        # Fix 2d: populated by build()
-        self._prototypes = None      # cached prototype anchors [3, 512]
+        self.synonym_map = {}
+        self._prototypes = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -214,42 +247,30 @@ class KnowledgeGraphBuilder:
             print("[KG] Prototype anchors ready.")
         return self._prototypes
 
-    # Fix 2c: Noun-biased candidate extraction
-    def _extract_candidates(self, report_text):
+    def _build_morphological_synonyms(self, typed_terms):
         """
-        Returns (set of candidate terms, set of head nouns from bigrams).
-        Bigrams : w1 w2  — w2 is likely noun, w1 not a stopword
-        Trigrams: w1 w2 w3  — w1/w2 are modifiers, w3 is likely noun
-        Unigrams: tentative; filtered further in build()
+        Group morphological variants by stem. Keep highest-freq as canonical.
+        Only merges within the same type — cross-type merges are rejected.
+        Returns: (canonical_terms dict, synonym_map dict)
         """
-        clean  = self._clean_report(report_text)
-        words  = clean.split()
-        candidates  = set()
-        head_nouns  = set()
+        groups = {}
+        for term, info in typed_terms.items():
+            s = _stem(term)
+            groups.setdefault(s, []).append((term, info['freq']))
 
-        for k in range(len(words) - 1):
-            w1, w2 = words[k], words[k + 1]
-            if w1 in _STOPWORDS:
-                continue
-            if not _is_likely_noun(w2):
-                continue
-            candidates.add(w1 + ' ' + w2)
-            head_nouns.add(w2)
-
-        for k in range(len(words) - 2):
-            w1, w2, w3 = words[k], words[k + 1], words[k + 2]
-            if not _is_likely_noun(w3):
-                continue
-            if not (_is_modifier(w1) and _is_modifier(w2)):
-                continue
-            candidates.add(w1 + ' ' + w2 + ' ' + w3)
-            head_nouns.add(w3)
-
-        for w in words:
-            if len(w) > 3 and w not in _STOPWORDS:
-                candidates.add(w)
-
-        return candidates, head_nouns
+        synonym_map    = {}
+        canonical_terms = {}
+        for stem, members in groups.items():
+            members.sort(key=lambda x: -x[1])
+            canonical = members[0][0]
+            canonical_terms[canonical] = typed_terms[canonical]
+            for term, _ in members[1:]:
+                if typed_terms[term]['type'] == typed_terms[canonical]['type']:
+                    synonym_map[term] = canonical
+                else:
+                    # Cross-type: keep as separate node
+                    canonical_terms[term] = typed_terms[term]
+        return canonical_terms, synonym_map
 
     # ------------------------------------------------------------------
     # Public: build graph
@@ -268,134 +289,188 @@ class KnowledgeGraphBuilder:
         ann     = json.loads(open(self.ann_path, 'r').read())
         reports = ann[split]
 
-        # ---- Phase 1: corpus scan ----
+        # ---- Phase 1: corpus scan — unigram-first ----
         print(f"[KG] Phase 1: scanning {len(reports)} reports...")
-        term_doc_freq       = Counter()
-        bigram_to_head      = {}      # bigram string → head noun
+        unigram_freq = Counter()
+        bigram_freq  = Counter()
 
         for example in reports:
-            candidates, head_nouns = self._extract_candidates(example['report'])
-            for t in candidates:
-                term_doc_freq[t] += 1
             clean = self._clean_report(example['report'])
             words = clean.split()
+            seen_uni = set()
+            seen_bi  = set()
+            for w in words:
+                if (len(w) >= 4
+                        and w not in _STOPWORDS
+                        and w.isalpha()):
+                    seen_uni.add(w)
             for k in range(len(words) - 1):
-                w1, w2 = words[k], words[k + 1]
-                if w1 not in _STOPWORDS and _is_likely_noun(w2):
-                    bigram_to_head[w1 + ' ' + w2] = w2
+                bi = words[k] + ' ' + words[k + 1]
+                seen_bi.add(bi)
+            for w in seen_uni:
+                unigram_freq[w] += 1
+            for b in seen_bi:
+                bigram_freq[b] += 1
 
-        # Bigrams/trigrams: freq >= min_term_freq
-        retained_multi = {
-            t for t, f in term_doc_freq.items()
-            if f >= self.min_term_freq and ' ' in t
-        }
-        # Head nouns from retained bigrams
-        bigram_head_nouns = {
-            bigram_to_head[b] for b in retained_multi
-            if b.count(' ') == 1 and b in bigram_to_head
-        }
-        # Unigrams: must appear as head noun in a retained bigram AND freq >= 2x
+        # Unigrams: freq >= min_term_freq
         retained_uni = {
-            t for t, f in term_doc_freq.items()
-            if ' ' not in t
-            and f >= 2 * self.min_term_freq
-            and t in bigram_head_nouns
+            t for t, f in unigram_freq.items()
+            if f >= self.min_term_freq
         }
 
-        valid_terms = sorted(
-            list(retained_multi | retained_uni),
-            key=lambda t: -term_doc_freq[t]
+        # Bigrams: both tokens alphabetic, not stopwords, freq >= 30; cap at 10
+        _BIGRAM_MIN_FREQ = 30
+        _BIGRAM_CAP      = 10
+        valid_bigrams = []
+        for bi, f in bigram_freq.most_common():
+            if f < _BIGRAM_MIN_FREQ:
+                break
+            w1, w2 = bi.split()
+            if (w1 not in _STOPWORDS and w2 not in _STOPWORDS
+                    and w1.isalpha() and w2.isalpha()
+                    and len(w1) >= 4 and len(w2) >= 4):
+                valid_bigrams.append(bi)
+            if len(valid_bigrams) >= _BIGRAM_CAP:
+                break
+
+        all_candidates = sorted(
+            list(retained_uni) + valid_bigrams,
+            key=lambda t: -(unigram_freq.get(t, bigram_freq.get(t, 0)))
         )
 
-        # Cap before BiomedCLIP
+        # Pre-BiomedCLIP cap
         cap = self.max_nodes * 5
-        if len(valid_terms) > cap:
-            valid_terms = valid_terms[:cap]
+        if len(all_candidates) > cap:
+            all_candidates = all_candidates[:cap]
 
-        print(f"[KG] Phase 1 complete: {len(valid_terms)} candidates")
+        def _get_freq(t):
+            return unigram_freq.get(t, bigram_freq.get(t, 0))
 
-        if not valid_terms:
+        print(f"[KG] Phase 1 complete: {len(all_candidates)} candidates "
+              f"({len(retained_uni)} unigrams, {len(valid_bigrams)} bigrams)")
+
+        if not all_candidates:
             raise RuntimeError(
                 "[KG] No valid terms found — lower min_term_freq or check data.")
 
         # ---- Phase 2: BiomedCLIP typing ----
-        print(f"[KG] Phase 2: BiomedCLIP typing of {len(valid_terms)} terms...")
-        P         = self._get_prototypes()                               # [3, 512]
+        print(f"[KG] Phase 2: BiomedCLIP typing of {len(all_candidates)} terms...")
+        P         = self._get_prototypes()                                 # [3, 512]
         term_embs = biomedclip_encode_text(
-            valid_terms, device=self.biomedclip_device)                  # [N, 512]
+            all_candidates, device=self.biomedclip_device)                 # [N, 512]
 
-        sims = torch.matmul(term_embs, P.T)                             # [N, 3]
-        # Fix 2b: sharpen with low temperature, apply confidence threshold
-        probs            = F.softmax(sims / 0.05, dim=-1)
-        top_prob, top_idx = probs.max(dim=-1)
+        sims  = torch.matmul(term_embs, P.T)                              # [N, 3]
+        probs = F.softmax(sims / 0.05, dim=-1)
 
         type_names = ['anatomy', 'abnormal', 'normal']
-        threshold  = 0.6
+        type_thresholds = [
+            _CONF_THRESHOLD['anatomy'],
+            _CONF_THRESHOLD['abnormal'],
+            _CONF_THRESHOLD['normal'],
+        ]
 
-        surviving = []
-        dropped   = 0
-        for i, term in enumerate(valid_terms):
-            p = top_prob[i].item()
-            if p < threshold:
-                dropped += 1
+        typed_terms = {}   # term -> {type, prob, freq, emb}
+        dropped_low = 0
+        dropped_amb = 0
+
+        for i, term in enumerate(all_candidates):
+            p_vec = probs[i]
+            above = [(p_vec[j].item(), type_names[j])
+                     for j in range(3)
+                     if p_vec[j].item() >= type_thresholds[j]]
+
+            if len(above) == 0:
+                dropped_low += 1
                 continue
-            surviving.append({
-                'term': term,
-                'type': type_names[top_idx[i].item()],
-                'prob': p,
-                'freq': term_doc_freq[term],
+            # Pick highest prob among those that passed their threshold
+            best_prob, best_type = max(above, key=lambda x: x[0])
+            typed_terms[term] = {
+                'type': best_type,
+                'prob': best_prob,
+                'freq': _get_freq(term),
                 'emb':  term_embs[i],
-            })
+                'origin': 'typed',
+            }
 
-        print(f"[KG] Confidence threshold ({threshold}): "
-              f"kept {len(surviving)}, dropped {dropped} ambiguous terms")
+        print(f"[KG] Confidence thresholding: kept {len(typed_terms)}, "
+              f"dropped {dropped_low} below threshold, "
+              f"{dropped_amb} ambiguous")
 
-        if not surviving:
-            raise RuntimeError(
-                "[KG] All terms dropped by confidence threshold — "
-                "lower threshold or verify BiomedCLIP installation.")
-
-        # ---- Fix 2d: Synonym clustering ----
-        M = len(surviving)
-        self.synonym_map = {}
-        if M > 1:
-            emb_stack  = torch.stack([s['emb'] for s in surviving])    # [M, 512]
-            sim_matrix = torch.matmul(emb_stack, emb_stack.T)          # [M, M]
-            is_canon   = [True] * M
-
-            pairs = [(sim_matrix[i, j].item(), i, j)
-                     for i in range(M) for j in range(i + 1, M)]
-            pairs.sort(key=lambda x: -x[0])
-
-            for sim_val, i, j in pairs:
-                if sim_val <= 0.92:
-                    break
-                if not is_canon[i] or not is_canon[j]:
+        # ---- Phase 3: Backfill whitelists ----
+        backfill_sets = [
+            (_ANATOMY_BACKFILL,  'anatomy'),
+            (_NORMAL_BACKFILL,   'normal'),
+            (_ABNORMAL_BACKFILL, 'abnormal'),
+        ]
+        for bset, btype in backfill_sets:
+            for term in bset:
+                freq = _get_freq(term)
+                if freq < _BACKFILL_FREQ_MIN:
                     continue
-                # Higher-frequency term is canonical
-                if surviving[i]['freq'] >= surviving[j]['freq']:
-                    canon, variant = i, j
+                if term in typed_terms and typed_terms[term]['type'] == btype:
+                    continue  # already correctly typed
+
+                # Determine BiomedCLIP conf if available (for logging)
+                if term in all_candidates:
+                    idx = all_candidates.index(term)
+                    biomedclip_conf = probs[idx, type_names.index(btype)].item()
+                    conf_str = f"BiomedCLIP conf={biomedclip_conf:.2f}"
+                    if term in typed_terms:
+                        old_type = typed_terms[term]['type']
+                        conf_str += f", was {old_type}"
                 else:
-                    canon, variant = j, i
-                is_canon[variant] = False
-                self.synonym_map[surviving[variant]['term']] = \
-                    surviving[canon]['term']
+                    conf_str = "not in candidates"
 
-            surviving = [s for k, s in enumerate(surviving) if is_canon[k]]
+                print(f"[KG] Backfilled {btype}: '{term}' "
+                      f"(freq={freq}, {conf_str})")
 
-        print(f"[KG] Synonym merges: {len(self.synonym_map)}, "
-              f"{len(surviving)} unique terms remaining")
+                if term in all_candidates:
+                    idx = all_candidates.index(term)
+                    emb = term_embs[idx]
+                else:
+                    # Encode on the fly
+                    emb = biomedclip_encode_text(
+                        [term], device=self.biomedclip_device)[0]
 
-        # ---- Fix 2e: Score and cap (no forced balance) ----
-        surviving.sort(key=lambda s: -(s['freq'] * s['prob']))
-        surviving = surviving[:self.max_nodes]
+                typed_terms[term] = {
+                    'type':   btype,
+                    'prob':   1.0,
+                    'freq':   freq,
+                    'emb':    emb,
+                    'origin': 'backfill',
+                }
 
-        node_list  = [s['term'] for s in surviving]
-        node_types = [s['type'] for s in surviving]
+        if not typed_terms:
+            raise RuntimeError(
+                "[KG] All terms dropped — lower thresholds or verify data.")
+
+        # ---- Phase 4: Morphological synonym map ----
+        canonical_terms, self.synonym_map = \
+            self._build_morphological_synonyms(typed_terms)
+
+        print(f"[KG] Morphological synonyms: {len(self.synonym_map)} entries, "
+              f"{len(canonical_terms)} unique terms")
+
+        # ---- Phase 5: Score and cap ----
+        # Backfilled terms always kept; remaining sorted by freq × prob
+        backfilled = {t: info for t, info in canonical_terms.items()
+                      if info['origin'] == 'backfill'}
+        scored = [(t, info) for t, info in canonical_terms.items()
+                  if info['origin'] != 'backfill']
+        scored.sort(key=lambda x: -(x[1]['freq'] * x[1]['prob']))
+
+        remaining_cap = max(0, self.max_nodes - len(backfilled))
+        scored = scored[:remaining_cap]
+
+        surviving = list(backfilled.items()) + scored
+
+        node_list  = [t for t, _ in surviving]
+        node_info  = [info for _, info in surviving]
+        node_types = [info['type'] for info in node_info]
         node2idx   = {name: idx for idx, name in enumerate(node_list)}
         N          = len(node_list)
 
-        # ---- Co-occurrence pass (on final node set) ----
+        # ---- Co-occurrence pass ----
         print(f"[KG] Computing co-occurrence for {N} nodes...")
         co_occurrence = defaultdict(int)
         for example in reports:
@@ -411,16 +486,15 @@ class KnowledgeGraphBuilder:
         adj = np.zeros((N, N), dtype=np.float32)
         for (t1, t2), count in co_occurrence.items():
             if t1 in node2idx and t2 in node2idx and count >= self.co_occur_threshold:
-                i, j       = node2idx[t1], node2idx[t2]
-                adj[i, j]  = count
-                adj[j, i]  = count
+                i, j      = node2idx[t1], node2idx[t2]
+                adj[i, j] = count
+                adj[j, i] = count
 
-        # Symmetric normalisation: D^{-1/2} A D^{-1/2}
-        adj    += np.eye(N)
-        deg     = adj.sum(axis=1)
-        d_inv   = np.power(deg, -0.5)
+        adj += np.eye(N)
+        deg  = adj.sum(axis=1)
+        d_inv = np.power(deg, -0.5)
         d_inv[np.isinf(d_inv)] = 0.0
-        adj     = np.diag(d_inv) @ adj @ np.diag(d_inv)
+        adj = np.diag(d_inv) @ adj @ np.diag(d_inv)
 
         # Cache
         self._node_list = node_list
@@ -428,20 +502,21 @@ class KnowledgeGraphBuilder:
 
         # ---- Print final node list ----
         by_type = defaultdict(list)
-        for s in surviving:
-            by_type[s['type']].append(s)
-        n_anat  = len(by_type['anatomy'])
-        n_abnl  = len(by_type['abnormal'])
-        n_norm  = len(by_type['normal'])
+        for t, info in surviving:
+            by_type[info['type']].append((t, info))
+        n_anat = len(by_type['anatomy'])
+        n_abnl = len(by_type['abnormal'])
+        n_norm = len(by_type['normal'])
         print(f"\n[KG] Final graph: {N} nodes  "
               f"({n_anat} anatomy, {n_abnl} abnormal, {n_norm} normal)  "
               f"synonym map: {len(self.synonym_map)} entries")
         for cat in ('anatomy', 'abnormal', 'normal'):
-            for s in by_type[cat]:
-                print(f"    [{cat:8s}]  {s['term']:<35s}  "
-                      f"freq={s['freq']:5d}  conf={s['prob']:.2f}")
+            for t, info in by_type[cat]:
+                tag = f"[{info['origin']}]" if info['origin'] == 'backfill' else ''
+                print(f"    [{cat:8s}]  {t:<35s}  "
+                      f"freq={info['freq']:5d}  conf={info['prob']:.2f}  {tag}")
         if self.synonym_map:
-            print("[KG] Synonyms:")
+            print("[KG] Synonyms (morphological only):")
             for src, dst in sorted(self.synonym_map.items()):
                 print(f"    {src} → {dst}")
         print()
@@ -449,72 +524,48 @@ class KnowledgeGraphBuilder:
         return node_list, node_types, adj, node2idx
 
     # ------------------------------------------------------------------
-    # Fix 3: Three-layer label extraction
+    # Fix 3: Simplified label extraction — exact stem (unigram) or consecutive (bigram)
     # ------------------------------------------------------------------
-
-    def _apply_synonym_map(self, text):
-        """Replace synonym variants with their canonical forms (longest first)."""
-        for src, dst in sorted(self.synonym_map.items(),
-                               key=lambda x: -len(x[0].split())):
-            text = re.sub(r'\b' + re.escape(src) + r'\b', dst, text)
-        return text
-
-    def _stems_in_window(self, node_stems, report_stems, window=3):
-        """
-        True if node_stems appears as an in-order subsequence within any
-        sliding window of size len(node_stems)+window over report_stems.
-        """
-        n        = len(node_stems)
-        win_size = n + window
-        for start in range(len(report_stems) - n + 1):
-            segment = report_stems[start: start + win_size]
-            idx     = 0
-            for s in segment:
-                if s == node_stems[idx]:
-                    idx += 1
-                    if idx == n:
-                        return True
-        return False
 
     def extract_labels_for_report(self, report_text, node_list, node2idx):
         """
-        Fix 3: Binary label vector [N].
-        Layer 1 — synonym canonicalization
-        Layer 2 — stemming
-        Layer 3 — multi-word proximity matching (window=3)
+        Binary label vector [N].
+        Applies synonym map first, then stemming for unigrams.
+        Bigram nodes require consecutive stem match in the token stream.
         """
-        clean = self._clean_report(report_text)
-        if self.synonym_map:
-            clean = self._apply_synonym_map(clean)
-        stems  = [_stem(t) for t in clean.split()]
+        clean  = self._clean_report(report_text)
+        tokens = clean.split()
+        # Apply synonym map to report tokens
+        tokens = [self.synonym_map.get(t, t) for t in tokens]
+        stems  = [_stem(t) for t in tokens]
+        stem_set = set(stems)
 
         labels = np.zeros(len(node_list), dtype=np.float32)
         for i, node in enumerate(node_list):
-            node_stems = [_stem(t) for t in node.split()]
-            if len(node_stems) == 1:
-                if node_stems[0] in stems:
-                    labels[i] = 1.0
+            if ' ' in node:
+                node_stems = [_stem(t) for t in node.split()]
+                for j in range(len(stems) - len(node_stems) + 1):
+                    if stems[j:j + len(node_stems)] == node_stems:
+                        labels[i] = 1.0
+                        break
             else:
-                if self._stems_in_window(node_stems, stems, window=3):
+                if _stem(node) in stem_set:
                     labels[i] = 1.0
         return labels
 
     def is_normal_report(self, report_text):
         """
         True if BiomedCLIP prototype similarity: normal > abnormal.
-        Uses same prototype anchors as build() for consistency.
         """
         clean   = self._clean_report(report_text)
-        P       = self._get_prototypes()                                # [3, 512]
-        rep_emb = biomedclip_encode_text([clean],
-                                         device=self.biomedclip_device) # [1, 512]
-        sims    = torch.matmul(rep_emb, P.T).squeeze(0)                # [3]
-        # indices: 0=anatomy, 1=abnormal, 2=normal
+        P       = self._get_prototypes()
+        rep_emb = biomedclip_encode_text([clean], device=self.biomedclip_device)
+        sims    = torch.matmul(rep_emb, P.T).squeeze(0)
         return sims[2].item() > sims[1].item()
 
 
 # =============================================================================
-# 4. GCN Layer — global [N, N] adjacency
+# 3. GCN Layer — global [N, N] adjacency
 # =============================================================================
 
 class GraphConvolution(nn.Module):
@@ -535,7 +586,7 @@ class GraphConvolution(nn.Module):
 
 
 # =============================================================================
-# 5. KnowledgeGraphEncoder — image-conditioned GCN, global adj
+# 4. KnowledgeGraphEncoder — image-conditioned GCN, global adj
 # =============================================================================
 
 class KnowledgeGraphEncoder(nn.Module):
@@ -586,7 +637,7 @@ class KnowledgeGraphEncoder(nn.Module):
 
 
 # =============================================================================
-# 6. Multi-label classifier
+# 5. Multi-label classifier
 # =============================================================================
 
 class KGMultiLabelClassifier(nn.Module):
@@ -605,7 +656,7 @@ class KGMultiLabelClassifier(nn.Module):
 
 
 # =============================================================================
-# 7. KG Cross-Attention
+# 6. KG Cross-Attention (Fix 1 — gated residual, unchanged from v4)
 # =============================================================================
 
 class KGCrossAttention(nn.Module):
@@ -644,7 +695,7 @@ class KGCrossAttention(nn.Module):
 
 
 # =============================================================================
-# 8. KG Alignment Loss
+# 7. KG Alignment Loss
 # =============================================================================
 
 class KGAlignmentLoss(nn.Module):
