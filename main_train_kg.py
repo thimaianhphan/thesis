@@ -132,7 +132,8 @@ def parse_agrs():
                         help='Min document frequency for a corpus term to be a KG node.')
     parser.add_argument('--kg_max_nodes', type=int, default=150,
                         help='Hard cap on total KG nodes.')
-    parser.add_argument('--biomedclip_device', type=str, default='cpu',
+    parser.add_argument('--biomedclip_device', type=str,
+                        default='cuda' if __import__('torch').cuda.is_available() else 'cpu',
                         help="Device for BiomedCLIP during graph build / CA pool. "
                              "Use 'cuda' to speed up node typing on large corpora.")
 

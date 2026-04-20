@@ -1,0 +1,4 @@
+open_clip_torch 
+opencv-python-headless 
+pycocoevalcap 
+datasets
