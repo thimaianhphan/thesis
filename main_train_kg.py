@@ -54,7 +54,7 @@ def parse_agrs():
 
     # Visual extractor
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
-                        choices=['resnet101', 'medsam'],
+                        choices=['resnet101', 'medsam', 'resnet50'],
                         help="'resnet101' (d_vf=2048) or 'medsam' (d_vf=256)")
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True)
     parser.add_argument('--freeze_visual_extractor', action='store_true',
