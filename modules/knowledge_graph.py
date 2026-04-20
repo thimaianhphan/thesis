@@ -521,7 +521,9 @@ class KnowledgeGraphBuilder:
                 print(f"    {src} → {dst}")
         print()
 
-        return node_list, node_types, adj, node2idx
+        node_embs = torch.stack([info['emb'] for _, info in surviving], dim=0)  # [N, 512]
+
+        return node_list, node_types, adj, node2idx, node_embs
 
     # ------------------------------------------------------------------
     # Fix 3: Simplified label extraction — exact stem (unigram) or consecutive (bigram)
@@ -591,7 +593,7 @@ class GraphConvolution(nn.Module):
 
 class KnowledgeGraphEncoder(nn.Module):
     def __init__(self, num_nodes, node_types, d_model, d_visual,
-                 num_gcn_layers=1, dropout=0.1, gcn_residual_alpha=0.2):
+                 node_init_emb=None, num_gcn_layers=1, dropout=0.1, gcn_residual_alpha=0.2):
         super().__init__()
         self.num_nodes = num_nodes
         self.d_model   = d_model
@@ -613,7 +615,20 @@ class KnowledgeGraphEncoder(nn.Module):
             nn.Linear(d_visual, d_model), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(d_model, num_nodes),
         )
-        nn.init.xavier_uniform_(self.node_embeddings.weight)
+        if node_init_emb is not None:
+            with torch.no_grad():
+                emb_dim = node_init_emb.size(-1)
+                proj = nn.Linear(emb_dim, d_model, bias=False)
+                nn.init.xavier_uniform_(proj.weight)
+                init = proj(node_init_emb.float())             # [N, d_model]
+                init = F.normalize(init, dim=-1)               # unit length
+                init = init * (d_model ** -0.5)                # match xavier variance
+                self.node_embeddings.weight.data.copy_(init)
+            print(f"[KG] Node embeddings initialized from BiomedCLIP "
+                  f"({emb_dim}→{d_model}), kept trainable")
+        else:
+            nn.init.xavier_uniform_(self.node_embeddings.weight)
+            print(f"[KG] Node embeddings initialized randomly (xavier)")
         nn.init.xavier_uniform_(self.type_embeddings.weight)
 
     def forward(self, adj, fc_feats):

@@ -144,7 +144,7 @@ class KGEncoderDecoder(AttModel):
             args.ann_path, args.dataset_name,
             co_occur_threshold=getattr(args, 'kg_co_occur_threshold', 3),
         )
-        node_list, node_types, adjacency, node2idx = kg_builder.build(split='train')
+        node_list, node_types, adjacency, node2idx, node_embs = kg_builder.build(split='train')
         self.node_list = node_list
         self.node_types = node_types
         self.node2idx = node2idx
@@ -157,6 +157,7 @@ class KGEncoderDecoder(AttModel):
         self.kg_encoder = KnowledgeGraphEncoder(
             num_nodes=self.num_kg_nodes, node_types=node_types,
             d_model=args.d_model, d_visual=d_visual,
+            node_init_emb=node_embs,
             num_gcn_layers=getattr(args, 'kg_num_gcn_layers', 1),
             dropout=args.dropout,
             gcn_residual_alpha=getattr(args, 'kg_gcn_alpha', 0.2),
