@@ -32,6 +32,7 @@ Usage: replace args.visual_extractor = 'medsam' and set args.d_vf = 256.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 from transformers import SamModel, SamProcessor
  
  
@@ -136,7 +137,7 @@ class MedSAMVisualExtractor(nn.Module):
 
 class ResNetVisualExtractor(nn.Module):
     def __init__(self, args):
-        super(ResNetVisualExtractor, self).__init__()
+        super(VisualExtractor, self).__init__()
         self.visual_extractor = args.visual_extractor
         self.pretrained = args.visual_extractor_pretrained
         model = getattr(models, self.visual_extractor)(pretrained=self.pretrained)
