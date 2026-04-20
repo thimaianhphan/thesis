@@ -1,3 +1,8 @@
+# NOTE: Graph vocabulary is built dynamically from the training corpus via
+# BiomedCLIP. Checkpoints are tied to a specific node count. After any change
+# to KnowledgeGraphBuilder (node cap, thresholds, anchors) you MUST retrain
+# from scratch — old checkpoints will not load due to shape mismatches.
+
 import torch
 import torch.nn as nn
 import numpy as np

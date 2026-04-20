@@ -29,7 +29,7 @@ class ContrastiveAttention(nn.Module):
         self.d_fc          = d_fc
         self.pool_size     = pool_size
         self.num_agg_rounds = num_agg_rounds
-        self.register_buffer('normality_pool', torch.zeros(pool_size, d_model))
+        self.register_buffer('normality_pool', torch.zeros(pool_size, d_fc))
         self.pool_initialized = False
 
         # Always-present projection: fc → d_model
@@ -47,7 +47,7 @@ class ContrastiveAttention(nn.Module):
         )
         self.gate = nn.Sequential(nn.Linear(d_model * 2, 1), nn.Sigmoid())
         nn.init.constant_(self.gate[0].bias, -1.0)
-        self.residual_scale = nn.Parameter(torch.tensor(0.1))
+        self.residual_scale = nn.Parameter(torch.tensor(0.3))
 
         for proj in self.agg_projections:
             nn.init.xavier_uniform_(proj.weight)
@@ -121,9 +121,8 @@ class ContrastiveAttention(nn.Module):
                         fc = torch.cat([fc_0, fc_1], dim=1)
                     else:
                         _, fc = visual_extractor(images[i:i+1])
-                    # Project to d_model using our fc_proj
-                    projected = self.fc_proj(fc.to(device))   # [1, d_model]
-                    all_feats.append(projected.squeeze(0).cpu())
+                    # Fix 1: store raw fc (no projection — fc_proj drifts during training)
+                    all_feats.append(fc.squeeze(0).cpu())
                 if len(all_feats) >= pool_size * 2:
                     break
 
@@ -141,14 +140,14 @@ class ContrastiveAttention(nn.Module):
         n = all_feats.size(0)
         self.normality_pool[:n] = all_feats.to(self.normality_pool.device)
         self.pool_initialized = True
-        print(f"[CA] Normality pool built: {n} features, dim={self.d_model}")
+        print(f"[CA] Normality pool built: {n} raw fc features, dim={self.d_fc}")
 
     # ------------------------------------------------------------------
     # Core CA operations
     # ------------------------------------------------------------------
 
-    def _aggregate_attention(self, v_hat):
-        P = self.normality_pool                              # [pool_size, d_model]
+    def _aggregate_attention(self, v_hat, P):
+        """P: [pool_size, d_model] — already projected by fc_proj at call site."""
         v_agg = torch.zeros_like(v_hat)
         for proj in self.agg_projections:
             q      = proj(v_hat)                            # [B, d_model]
@@ -181,8 +180,10 @@ class ContrastiveAttention(nn.Module):
         if not self.pool_initialized:
             return att_feats
 
+        # Fix 1: project both query and pool with current fc_proj weights
         v_hat  = self.fc_proj(fc_feats)                         # [B, d_model]
-        v_agg  = self._aggregate_attention(v_hat)               # [B, d_model]
+        P      = self.fc_proj(self.normality_pool)              # [pool_size, d_model]
+        v_agg  = self._aggregate_attention(v_hat, P)            # [B, d_model]
         v_diff = self._differentiate_attention(v_hat, v_agg)   # [B, d_model]
 
         v_diff_exp = v_diff.unsqueeze(1).expand_as(att_feats)  # [B, N, d_model]
