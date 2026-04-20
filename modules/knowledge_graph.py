@@ -175,7 +175,7 @@ _STOPWORDS = {
     # temporal/measurement filler
     'prior', 'previous', 'current', 'today', 'since', 'acute', 'chronic',
     # structure words that embed badly as isolated tokens
-    'soft', 'tissue', 'structures', 'bony',
+    'soft', 'tissue', 'structures', 'bony', 'xxxx',
 }
 
 # Fix 2f: Backfill whitelists — force correct type if present at freq >= 50
