@@ -1,4 +1,5 @@
 import os
+import json as _json
 from abc import abstractmethod
 
 import time
@@ -185,21 +186,56 @@ class Trainer(BaseTrainer):
         self.val_dataloader = val_dataloader
         self.test_dataloader = test_dataloader
 
+        # Cache: image_id -> raw report, used for KG auxiliary loss
+        _ann = _json.loads(open(args.ann_path, 'r').read())
+        self._id_to_report = {}
+        for _split in ('train', 'val', 'test'):
+            for _ex in _ann.get(_split, []):
+                self._id_to_report[_ex['id']] = _ex['report']
+
     def _train_epoch(self, epoch):
 
         train_loss = 0
+        train_lm = 0
+        train_kg = 0
         self.model.train()
         for batch_idx, (images_id, images, reports_ids, reports_masks) in enumerate(self.train_dataloader):
             images, reports_ids, reports_masks = images.to(self.device), reports_ids.to(self.device), reports_masks.to(
                 self.device)
+
             output = self.model(images, reports_ids, mode='train')
-            loss = self.criterion(output, reports_ids, reports_masks)
+            lm_loss = self.criterion(output, reports_ids, reports_masks)
+
+            # ------ KG auxiliary loss (Change 2) ------
+            kg_loss = None
+            model_ref = self.model.module if hasattr(self.model, 'module') else self.model
+            if hasattr(model_ref, 'kg_classifier'):
+                batch_reports = [self._id_to_report.get(iid, '') for iid in images_id]
+                kg_labels = model_ref.encoder_decoder.get_kg_labels(batch_reports).to(self.device)
+                kg_logits = model_ref.classify_kg_nodes(images)
+                kg_loss = model_ref.kg_classifier.get_loss(kg_logits, kg_labels)
+                kg_weight = getattr(model_ref.encoder_decoder, 'kg_loss_weight', 0.1)
+                loss = lm_loss + kg_weight * kg_loss
+                if epoch == 1 and batch_idx == 0:
+                    print(f"[DEBUG] kg_labels mean positives per sample: {kg_labels.sum(-1).float().mean().item():.2f}")
+                    print(f"[DEBUG] kg_labels shape: {kg_labels.shape}")
+            else:
+                loss = lm_loss
+            # ------------------------------------------
+
             train_loss += loss.item()
+            train_lm += lm_loss.item()
+            if kg_loss is not None:
+                train_kg += kg_loss.item()
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_value_(self.model.parameters(), 0.1)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
             self.optimizer.step()
-        log = {'train_loss': train_loss / len(self.train_dataloader)}
+        log = {
+            'train_loss': train_loss / len(self.train_dataloader),
+            'train_lm':   train_lm / len(self.train_dataloader),
+            'train_kg':   train_kg / len(self.train_dataloader),
+        }
 
         self.model.eval()
         with torch.no_grad():

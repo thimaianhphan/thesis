@@ -1,4 +1,4 @@
-python main_train.py \
+python main_train_kg.py \
 --image_dir data/iu_xray/images/ \
 --ann_path data/iu_xray/annotation.json \
 --dataset_name iu_xray \
@@ -9,4 +9,6 @@ python main_train.py \
 --save_dir results/iu_xray \
 --step_size 50 \
 --gamma 0.1 \
+--label_smoothing 0.1 \
+--use_expert_memory \
 --seed 9223

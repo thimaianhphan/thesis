@@ -23,7 +23,7 @@ import math
 from .visual_extractor import VisualExtractor
 from .encoder_decoder import (
     Encoder, EncoderLayer, MultiHeadedAttention, PositionwiseFeedForward,
-    PositionalEncoding, Embeddings, RelationalMemory,
+    PositionalEncoding, Embeddings, RelationalMemory, ExpertMemory,
     ConditionalSublayerConnection, LayerNorm, clones, subsequent_mask
 )
 from .att_model import pack_wrapper, AttModel
@@ -90,7 +90,7 @@ class KGTransformer(nn.Module):
 
     def decode(self, hidden_states, src_mask, tgt, tgt_mask, kg_feats=None):
         memory = self.rm.init_memory(hidden_states.size(0)).to(hidden_states)
-        memory = self.rm(self.tgt_embed(tgt), memory)
+        memory = self.rm(self.tgt_embed(tgt), memory, hidden_states)
         return self.decoder(self.tgt_embed(tgt), hidden_states, src_mask, tgt_mask, memory, kg_feats)
 
 
@@ -105,10 +105,16 @@ class KGEncoderDecoder(AttModel):
         attn = MultiHeadedAttention(self.num_heads, self.d_model)
         ff = PositionwiseFeedForward(self.d_model, self.d_ff, self.dropout)
         position = PositionalEncoding(self.d_model, self.dropout)
-        rm = RelationalMemory(
-            num_slots=self.rm_num_slots, d_model=self.rm_d_model,
-            num_heads=self.rm_num_heads
-        )
+        if getattr(self.args, 'use_expert_memory', False):
+            rm = ExpertMemory(
+                num_slots=self.rm_num_slots, d_model=self.rm_d_model,
+                num_heads=self.rm_num_heads, dropout=self.dropout,
+            )
+        else:
+            rm = RelationalMemory(
+                num_slots=self.rm_num_slots, d_model=self.rm_d_model,
+                num_heads=self.rm_num_heads,
+            )
         model = KGTransformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
             KGDecoder(
@@ -186,7 +192,7 @@ class KGEncoderDecoder(AttModel):
     def _prepare_feature(self, fc_feats, att_feats, att_masks):
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks)
         if self.contrastive_attn is not None:
-            att_feats = self.contrastive_attn(att_feats, self._cached_fc_feats)
+            att_feats = self.contrastive_attn(att_feats, fc_feats)
         memory = self.model.encode(att_feats, att_masks)
         return fc_feats[..., :1], att_feats[..., :1], memory, att_masks
 
@@ -207,6 +213,7 @@ class KGEncoderDecoder(AttModel):
         return att_feats, seq, att_masks, seq_mask
 
     def _forward(self, fc_feats, att_feats, seq, att_masks=None):
+        self._cached_fc_feats = fc_feats  # used by kg_classifier in trainer
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks, seq)
         if self.contrastive_attn is not None:
             att_feats = self.contrastive_attn(att_feats, fc_feats)

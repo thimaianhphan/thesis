@@ -51,7 +51,7 @@ class Transformer(nn.Module):
 
     def decode(self, hidden_states, src_mask, tgt, tgt_mask):
         memory = self.rm.init_memory(hidden_states.size(0)).to(hidden_states)
-        memory = self.rm(self.tgt_embed(tgt), memory)
+        memory = self.rm(self.tgt_embed(tgt), memory, hidden_states)
         return self.decoder(self.tgt_embed(tgt), hidden_states, src_mask, tgt_mask, memory)
 
 
@@ -290,7 +290,8 @@ class RelationalMemory(nn.Module):
 
         return next_memory
 
-    def forward(self, inputs, memory):
+    def forward(self, inputs, memory, image_enc=None):
+        # image_enc accepted for interface compatibility with ExpertMemory; unused here
         outputs = []
         for i in range(inputs.shape[1]):
             memory = self.forward_step(inputs[:, i], memory)
@@ -300,6 +301,75 @@ class RelationalMemory(nn.Module):
         return outputs
 
 
+class ExpertMemory(nn.Module):
+    """
+    Replaces RelationalMemory. Learnable expert tokens cross-attend to the
+    image encoder output, producing an image-conditioned memory tensor that
+    drives the ConditionalLayerNorm in each decoder sub-layer.
+
+    Output shape: [B, T, num_slots * d_model]  — identical to RelationalMemory,
+    so ConditionalLayerNorm requires no changes.
+
+    Motivation: RelationalMemory initialises from an identity matrix and
+    updates via GRU gates on target tokens — it contains no image information
+    until the decoder implicitly learns it through cross-attention. Expert
+    tokens instead explicitly distil the image into a small set of structured
+    summaries before decoding begins, giving the MCLN image-grounded scale
+    and shift parameters from step 0.
+
+    Reference: METransformer (Wang et al., CVPR 2023) — expert tokens with
+    cross-attention to image patches achieve BLEU-4 ~0.310 on IU X-ray.
+    """
+
+    def __init__(self, num_slots, d_model, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_slots = num_slots
+        self.d_model = d_model
+
+        self.expert_queries = nn.Parameter(torch.empty(1, num_slots, d_model))
+        nn.init.normal_(self.expert_queries, std=0.02)
+
+        self.cross_attn = MultiHeadedAttention(num_heads, d_model)
+        self.norm1 = LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.norm2 = LayerNorm(d_model)
+
+        for m in self.ffn.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0.)
+
+    def init_memory(self, batch_size):
+        # Return a dummy tensor — actual computation happens in forward()
+        return torch.zeros(batch_size, 1)
+
+    def forward(self, inputs, dummy_memory, image_enc=None):
+        """
+        inputs     : [B, T, d_model]  target token embeddings (T used for broadcast)
+        dummy_memory : ignored
+        image_enc  : [B, N, d_model]  transformer encoder output
+
+        Returns    : [B, T, num_slots * d_model]
+        """
+        B, T, _ = inputs.shape
+
+        if image_enc is None:
+            return torch.zeros(B, T, self.num_slots * self.d_model,
+                               device=inputs.device, dtype=inputs.dtype)
+
+        e = self.expert_queries.expand(B, -1, -1)               # [B, E, d_model]
+        e = self.norm1(e + self.cross_attn(e, image_enc, image_enc))
+        e = self.norm2(e + self.ffn(e))                         # [B, E, d_model]
+
+        e_flat = e.reshape(B, self.num_slots * self.d_model)    # [B, E*d_model]
+        return e_flat.unsqueeze(1).expand(-1, T, -1)            # [B, T, E*d_model]
+
+
 class EncoderDecoder(AttModel):
 
     def make_model(self, tgt_vocab):
@@ -307,7 +377,16 @@ class EncoderDecoder(AttModel):
         attn = MultiHeadedAttention(self.num_heads, self.d_model)
         ff = PositionwiseFeedForward(self.d_model, self.d_ff, self.dropout)
         position = PositionalEncoding(self.d_model, self.dropout)
-        rm = RelationalMemory(num_slots=self.rm_num_slots, d_model=self.rm_d_model, num_heads=self.rm_num_heads)
+        if getattr(self.args, 'use_expert_memory', False):
+            rm = ExpertMemory(
+                num_slots=self.rm_num_slots, d_model=self.rm_d_model,
+                num_heads=self.rm_num_heads, dropout=self.dropout,
+            )
+        else:
+            rm = RelationalMemory(
+                num_slots=self.rm_num_slots, d_model=self.rm_d_model,
+                num_heads=self.rm_num_heads,
+            )
         model = Transformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
             Decoder(

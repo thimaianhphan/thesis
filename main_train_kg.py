@@ -25,6 +25,7 @@ Contrastive Attention (optional, --use_contrastive_attention):
     (BiomedCLIP-based) instead of keyword heuristics.
 """
 
+import functools
 import torch
 import argparse
 import numpy as np
@@ -113,6 +114,14 @@ def parse_agrs():
     parser.add_argument('--lr_scheduler', type=str, default='StepLR')
     parser.add_argument('--step_size', type=int, default=50)
     parser.add_argument('--gamma', type=float, default=0.1)
+
+    # Loss
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help='Label smoothing epsilon (0 = off).')
+
+    # Architecture switches
+    parser.add_argument('--use_expert_memory', action='store_true',
+                        help='Replace RelationalMemory with image-conditioned ExpertMemory.')
 
     # Misc
     parser.add_argument('--seed', type=int, default=9233)
@@ -227,7 +236,7 @@ def pretrain_kg_classifier(model, train_dataloader, args, device):
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_value_(model.parameters(), 0.1)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -320,7 +329,7 @@ def main():
     print(f"  KG loss weight : {args.kg_loss_weight}")
     print("=" * 60)
 
-    criterion    = compute_loss
+    criterion    = functools.partial(compute_loss, label_smoothing=args.label_smoothing)
     metrics      = compute_scores
     optimizer    = build_kg_optimizer(args, model)
     lr_scheduler = build_lr_scheduler(args, optimizer)

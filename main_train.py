@@ -1,3 +1,4 @@
+import functools
 import torch
 import argparse
 import numpy as np
@@ -77,6 +78,12 @@ def parse_agrs():
     parser.add_argument('--lr_scheduler', type=str, default='StepLR', help='the type of the learning rate scheduler.')
     parser.add_argument('--step_size', type=int, default=50, help='the step size of the learning rate scheduler.')
     parser.add_argument('--gamma', type=float, default=0.1, help='the gamma of the learning rate scheduler.')
+    # Loss
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='label smoothing epsilon (0 = off).')
+    # Architecture switches
+    parser.add_argument('--use_expert_memory', action='store_true',
+                        help='replace RelationalMemory with image-conditioned ExpertMemory.')
 
     # Others
     parser.add_argument('--seed', type=int, default=9233, help='.')
@@ -108,7 +115,7 @@ def main():
     model = R2GenModel(args, tokenizer)
 
     # get function handles of loss and metrics
-    criterion = compute_loss
+    criterion = functools.partial(compute_loss, label_smoothing=args.label_smoothing)
     metrics = compute_scores
 
     # build optimizer, learning rate scheduler

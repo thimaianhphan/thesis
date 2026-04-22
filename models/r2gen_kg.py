@@ -40,6 +40,7 @@ class R2GenKGModel(nn.Module):
         att_feats_1, fc_feats_1 = self.visual_extractor(images[:, 1])
         fc_feats = torch.cat((fc_feats_0, fc_feats_1), dim=1)
         att_feats = torch.cat((att_feats_0, att_feats_1), dim=1)
+        self._cached_fc_feats = fc_feats  # used by classify_kg_nodes
         if mode == 'train':
             output = self.encoder_decoder(fc_feats, att_feats, targets, mode='forward')
         elif mode == 'sample':
@@ -51,6 +52,7 @@ class R2GenKGModel(nn.Module):
 
     def forward_mimic_cxr(self, images, targets=None, mode='train'):
         att_feats, fc_feats = self.visual_extractor(images)
+        self._cached_fc_feats = fc_feats  # used by classify_kg_nodes
         if mode == 'train':
             output = self.encoder_decoder(fc_feats, att_feats, targets, mode='forward')
         elif mode == 'sample':
@@ -61,6 +63,11 @@ class R2GenKGModel(nn.Module):
         return output
 
     def classify_kg_nodes(self, images):
+        # Use fc_feats cached during the main forward() — avoids a second visual pass
+        cached = getattr(self, '_cached_fc_feats', None)
+        if cached is not None:
+            return self.kg_classifier(cached)
+        # Fallback: rerun extractor (should not happen during normal training)
         if self.args.dataset_name == 'iu_xray':
             _, fc_feats_0 = self.visual_extractor(images[:, 0])
             _, fc_feats_1 = self.visual_extractor(images[:, 1])
