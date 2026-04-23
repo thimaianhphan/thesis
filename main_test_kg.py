@@ -68,9 +68,12 @@ def parse_agrs():
 
     # Model settings (for visual extractor)
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
+                        choices=['resnet101', 'resnet50', 'medsam'],
                         help='the visual extractor to be used.')
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True,
                         help='whether to load the pretrained visual extractor')
+    parser.add_argument('--freeze_visual_extractor', action='store_true',
+                        help='Freeze visual extractor backbone.')
 
     # Model settings (for Transformer)
     parser.add_argument('--d_model', type=int, default=512,
@@ -155,11 +158,15 @@ def parse_agrs():
     parser.add_argument('--load', type=str, required=True,
                         help='Path to the trained model checkpoint.')
 
+    # Architecture switches (must match training config)
+    parser.add_argument('--use_expert_memory', action='store_true',
+                        help='Use ExpertMemory instead of RelationalMemory (must match training).')
+
     # KG args (must match training config)
-    parser.add_argument('--kg_num_gcn_layers', type=int, default=2, help='.')
-    parser.add_argument('--kg_gcn_hidden', type=int, default=128, help='.')
+    parser.add_argument('--kg_num_gcn_layers', type=int, default=1, help='.')
     parser.add_argument('--kg_gcn_alpha', type=float, default=0.2, help='.')
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3, help='.')
+    parser.add_argument('--kg_loss_weight', type=float, default=0.1, help='.')
 
     # Contrastive Attention args
     parser.add_argument('--use_contrastive_attention', action='store_true',

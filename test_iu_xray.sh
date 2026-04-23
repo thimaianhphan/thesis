@@ -1,4 +1,4 @@
-python main_test.py \
+python main_test_kg.py \
 --image_dir data/iu_xray/images/ \
 --ann_path data/iu_xray/annotation.json \
 --dataset_name iu_xray \
@@ -6,8 +6,9 @@ python main_test.py \
 --threshold 3 \
 --batch_size 16 \
 --epochs 100 \
---save_dir results/iu_xray \
+--save_dir results/iu_xray_kg \
 --step_size 50 \
 --gamma 0.1 \
+--use_expert_memory \
 --seed 9223 \
---load data/model_iu_xray.pth
+--load results/iu_xray/model_best.pth

@@ -60,7 +60,7 @@ class BaseTester(object):
     def _load_checkpoint(self, load_path):
         load_path = str(load_path)
         self.logger.info("Loading checkpoint: {} ...".format(load_path))
-        checkpoint = torch.load(load_path)
+        checkpoint = torch.load(load_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['state_dict'])
 
 
