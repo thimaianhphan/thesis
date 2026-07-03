@@ -34,12 +34,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from transformers import SamModel, SamProcessor
- 
- 
+
+from modules.autoencoder import ConvEncoder
+
+
 MEDSAM_HF_ID = "wanglab/medsam-vit-base"
 MEDSAM_D_VF = 256
- 
- 
+AE_D_VF = 256
+
+
 class MedSAMVisualExtractor(nn.Module):
     """
     Visual feature extractor based on MedSAM's ViT-B image encoder.
@@ -135,6 +138,65 @@ class MedSAMVisualExtractor(nn.Module):
  
         return att_feats, fc_feats
 
+
+class AutoencoderVisualExtractor(nn.Module):
+    """
+    Visual feature extractor using the encoder half of a ConvAutoencoder
+    (modules/autoencoder.py) pretrained self-supervised on IU X-Ray
+    (see train_ae_iu_xray.ipynb).
+
+    ConvEncoder internals:
+        4x [Conv2d(k3,s2,p1) -> BatchNorm -> ReLU], 224x224 -> 14x14, channels 3->32->64->128->256
+
+    At 224x224:
+        att_feats : [B, 196, 256]  (14x14 grid)
+        fc_feats  : [B, 256]
+
+    d_vf = 256. Set args.d_vf = 256.
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        ckpt_path = getattr(args, 'autoencoder_ckpt', None)
+        if not ckpt_path:
+            raise ValueError(
+                "visual_extractor='autoencoder' requires --autoencoder_ckpt <path to ae_encoder.pth>"
+            )
+
+        self.encoder = ConvEncoder()
+        print(f"[Autoencoder] Loading encoder weights from {ckpt_path}...")
+        state_dict = torch.load(ckpt_path, map_location='cpu')
+        self.encoder.load_state_dict(state_dict, strict=True)
+
+        frozen = getattr(args, 'freeze_visual_extractor', False)
+        if frozen:
+            for p in self.encoder.parameters():
+                p.requires_grad_(False)
+            print("[Autoencoder] Encoder frozen.")
+        else:
+            print("[Autoencoder] Encoder trainable.")
+
+    def forward(self, images):
+        """
+        Args:
+            images : [B, 3, 224, 224]  ImageNet-normalized.
+
+        Returns:
+            att_feats : [B, 196, 256]
+            fc_feats  : [B, 256]
+        """
+        frozen = getattr(self.args, 'freeze_visual_extractor', False)
+        with torch.set_grad_enabled(self.training and not frozen):
+            feat_map = self.encoder(images)  # [B, 256, 14, 14]
+
+        att_feats = feat_map.flatten(2).transpose(1, 2)  # [B, 196, 256]
+        fc_feats = feat_map.mean(dim=(2, 3))              # [B, 256]
+
+        return att_feats, fc_feats
+
+
 class ResNetVisualExtractor(nn.Module):
     def __init__(self, args):
         super(ResNetVisualExtractor, self).__init__()
@@ -163,6 +225,7 @@ class VisualExtractor(nn.Module):
     args.visual_extractor:
         'resnet101' (default) → original ResNet-101 extractor
         'medsam'              → MedSAM ViT-B extractor (this file)
+        'autoencoder'         → ConvAutoencoder encoder pretrained on IU X-Ray (this file)
 
     Interface is identical:  forward(images) → (att_feats, fc_feats)
     """
@@ -174,6 +237,9 @@ class VisualExtractor(nn.Module):
         if extractor_name == 'medsam':
             self.extractor = MedSAMVisualExtractor(args)
             self.d_vf = MEDSAM_D_VF
+        elif extractor_name == 'autoencoder':
+            self.extractor = AutoencoderVisualExtractor(args)
+            self.d_vf = AE_D_VF
         else:
             self.extractor = ResNetVisualExtractor(args)
             self.d_vf = getattr(args, 'd_vf', 2048)

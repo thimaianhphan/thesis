@@ -55,17 +55,19 @@ def parse_agrs():
 
     # Visual extractor
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
-                        choices=['resnet101', 'medsam', 'resnet50'],
-                        help="'resnet101' (d_vf=2048) or 'medsam' (d_vf=256)")
+                        choices=['resnet101', 'medsam', 'resnet50', 'autoencoder'],
+                        help="'resnet101' (d_vf=2048), 'medsam' (d_vf=256), or 'autoencoder' (d_vf=256)")
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True)
+    parser.add_argument('--autoencoder_ckpt', type=str, default=None,
+                        help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
     parser.add_argument('--freeze_visual_extractor', action='store_true',
-                        help='Freeze visual extractor backbone (useful for MedSAM).')
+                        help='Freeze visual extractor backbone (useful for MedSAM/autoencoder).')
 
     # Transformer
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--d_ff', type=int, default=512)
     parser.add_argument('--d_vf', type=int, default=2048,
-                        help='Patch feature dim. Set 256 for MedSAM, 2048 for ResNet.')
+                        help='Patch feature dim. Set 256 for MedSAM/autoencoder, 2048 for ResNet.')
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--num_layers', type=int, default=3)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -157,10 +159,12 @@ def parse_agrs():
     args = parser.parse_args()
 
     # --- Consistency check ---
-    if args.visual_extractor == 'medsam' and args.d_vf != 256:
-        print(f"[WARNING] visual_extractor=medsam but d_vf={args.d_vf}. "
+    if args.visual_extractor in ('medsam', 'autoencoder') and args.d_vf != 256:
+        print(f"[WARNING] visual_extractor={args.visual_extractor} but d_vf={args.d_vf}. "
               f"Forcing d_vf=256.")
         args.d_vf = 256
+    if args.visual_extractor == 'autoencoder' and not args.autoencoder_ckpt:
+        raise ValueError("--visual_extractor autoencoder requires --autoencoder_ckpt <path to ae_encoder.pth>")
     if args.visual_extractor == 'resnet101' and args.d_vf == 256:
         print(f"[WARNING] visual_extractor=resnet101 but d_vf=256. "
               f"Forcing d_vf=2048.")

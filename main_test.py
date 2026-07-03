@@ -26,6 +26,8 @@ def parse_agrs():
     # Model settings (for visual extractor)
     parser.add_argument('--visual_extractor', type=str, default='resnet101', help='the visual extractor to be used.')
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True, help='whether to load the pretrained visual extractor')
+    parser.add_argument('--autoencoder_ckpt', type=str, default=None, help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
+    parser.add_argument('--freeze_visual_extractor', action='store_true', help='freeze the visual extractor backbone during training.')
 
     # Model settings (for Transformer)
     parser.add_argument('--d_model', type=int, default=512, help='the dimension of Transformer.')

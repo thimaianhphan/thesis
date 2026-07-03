@@ -68,10 +68,12 @@ def parse_agrs():
 
     # Model settings (for visual extractor)
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
-                        choices=['resnet101', 'resnet50', 'medsam'],
+                        choices=['resnet101', 'resnet50', 'medsam', 'autoencoder'],
                         help='the visual extractor to be used.')
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True,
                         help='whether to load the pretrained visual extractor')
+    parser.add_argument('--autoencoder_ckpt', type=str, default=None,
+                        help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
     parser.add_argument('--freeze_visual_extractor', action='store_true',
                         help='Freeze visual extractor backbone.')
 
@@ -175,6 +177,15 @@ def parse_agrs():
     parser.add_argument('--ca_num_rounds', type=int, default=3, help='.')
 
     args = parser.parse_args()
+
+    # --- Consistency check (must match training config) ---
+    if args.visual_extractor in ('medsam', 'autoencoder') and args.d_vf != 256:
+        print(f"[WARNING] visual_extractor={args.visual_extractor} but d_vf={args.d_vf}. "
+              f"Forcing d_vf=256.")
+        args.d_vf = 256
+    if args.visual_extractor == 'autoencoder' and not args.autoencoder_ckpt:
+        raise ValueError("--visual_extractor autoencoder requires --autoencoder_ckpt <path to ae_encoder.pth>")
+
     return args
 
 
