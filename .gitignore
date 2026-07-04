@@ -143,3 +143,6 @@ cython_debug/
 # Data
 data/iu_xray/
 data/mimic_cxr/
+
+#artifacts
+artifacts/vit_small_mae.pth

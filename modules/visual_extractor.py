@@ -1,8 +1,9 @@
 """
-MedSAM Visual Extractor for R2Gen
+Visual Extractors for R2Gen
 
-Replaces the ResNet-101 visual_extractor.py with MedSAM's ViT-B image encoder.
-Keeps the same interface: forward(images) -> (att_feats, fc_feats)
+Alternative visual backbones to the original ResNet-101 visual_extractor.py:
+MedSAM's ViT-B, a self-supervised ConvAutoencoder, and a MAE-pretrained
+ViT-Small/16. All keep the same interface: forward(images) -> (att_feats, fc_feats)
 
 MedSAM encoder (wanglab/medsam-vit-base):
   - Input : [B, 3, 1024, 1024]  (MedSAM native) or [B, 3, 224, 224] (auto-resized)
@@ -29,11 +30,14 @@ Usage: replace args.visual_extractor = 'medsam' and set args.d_vf = 256.
        is loaded by a modified VisualExtractor dispatcher (see bottom of file).
 """
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from transformers import SamModel, SamProcessor
+from timm.models.vision_transformer import VisionTransformer
 
 from modules.autoencoder import ConvEncoder
 
@@ -41,6 +45,17 @@ from modules.autoencoder import ConvEncoder
 MEDSAM_HF_ID = "wanglab/medsam-vit-base"
 MEDSAM_D_VF = 256
 AE_D_VF = 256
+
+# MAE-pretrained ViT-Small/16 (facebookresearch/mae format, checkpoint trained
+# on CheXpert + NIH ChestX-ray14 — see lambert-x/medical_mae). The checkpoint's
+# 'model' dict holds both encoder and decoder weights from MAE pretraining;
+# only the encoder half is used here for feature extraction.
+MAE_D_VF = 384
+MAE_IMG_SIZE = 224
+MAE_PATCH_SIZE = 16
+MAE_EMBED_DIM = 384
+MAE_DEPTH = 12
+MAE_NUM_HEADS = 6
 
 
 class MedSAMVisualExtractor(nn.Module):
@@ -197,6 +212,102 @@ class AutoencoderVisualExtractor(nn.Module):
         return att_feats, fc_feats
 
 
+class MAEVisualExtractor(nn.Module):
+    """
+    Visual feature extractor using a MAE-pretrained ViT-Small/16 encoder.
+
+    Checkpoint format: standard facebookresearch/mae pretraining output
+    (model='mae_vit_small_patch16_dec512d2b'), e.g. the medical_mae checkpoint
+    pretrained self-supervised on CheXpert + NIH ChestX-ray14. The checkpoint's
+    'model' dict contains both encoder and decoder weights; decoder_*/mask_token
+    keys are dropped here since the decoder is only used for MAE's pixel
+    reconstruction pretraining objective, not for feature extraction.
+
+    ViT-S/16 encoder: embed_dim=384, depth=12, heads=6, mlp_ratio=4, patch=16.
+    At 224x224 -> 14x14=196 patches + 1 cls token.
+
+    At 224x224:
+        att_feats : [B, 196, 384]  (14x14 grid, cls token dropped)
+        fc_feats  : [B, 384]       (mean over patch tokens)
+
+    d_vf = 384. Set args.d_vf = 384.
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+
+        ckpt_path = getattr(args, 'mae_ckpt', None)
+        if not ckpt_path:
+            raise ValueError(
+                "visual_extractor='mae' requires --mae_ckpt <path to MAE ViT-S/16 checkpoint>"
+            )
+
+        self.vit = VisionTransformer(
+            img_size=MAE_IMG_SIZE,
+            patch_size=MAE_PATCH_SIZE,
+            embed_dim=MAE_EMBED_DIM,
+            depth=MAE_DEPTH,
+            num_heads=MAE_NUM_HEADS,
+            mlp_ratio=4,
+            qkv_bias=True,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+            num_classes=0,
+        )
+
+        print(f"[MAE] Loading ViT-S/16 encoder weights from {ckpt_path}...")
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+
+        encoder_state = {
+            k: v for k, v in state_dict.items()
+            if not k.startswith('decoder_') and k != 'mask_token'
+        }
+
+        missing, unexpected = self.vit.load_state_dict(encoder_state, strict=False)
+        if missing:
+            print(f"[MAE] Missing keys (randomly initialized): {missing}")
+        if unexpected:
+            print(f"[MAE] Unexpected keys (ignored): {unexpected}")
+
+        frozen = getattr(args, 'freeze_visual_extractor', False)
+        if frozen:
+            for p in self.vit.parameters():
+                p.requires_grad_(False)
+            print("[MAE] Backbone frozen.")
+        else:
+            print("[MAE] Backbone trainable.")
+
+        print(f"[MAE] Ready. image_size={MAE_IMG_SIZE}, d_vf={MAE_D_VF}")
+
+    def forward(self, images):
+        """
+        Args:
+            images : [B, 3, H, W]  resized to 224x224 internally if needed.
+
+        Returns:
+            att_feats : [B, 196, 384]
+            fc_feats  : [B, 384]
+        """
+        if images.shape[-2] != MAE_IMG_SIZE or images.shape[-1] != MAE_IMG_SIZE:
+            images = F.interpolate(
+                images,
+                size=(MAE_IMG_SIZE, MAE_IMG_SIZE),
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        frozen = getattr(self.args, 'freeze_visual_extractor', False)
+        with torch.set_grad_enabled(self.training and not frozen):
+            tokens = self.vit.forward_features(images)  # [B, 197, 384] incl. cls token
+
+        patch_tokens = tokens[:, 1:, :]        # drop cls token -> [B, 196, 384]
+        att_feats = patch_tokens
+        fc_feats = patch_tokens.mean(dim=1)
+
+        return att_feats, fc_feats
+
+
 class ResNetVisualExtractor(nn.Module):
     def __init__(self, args):
         super(ResNetVisualExtractor, self).__init__()
@@ -226,6 +337,7 @@ class VisualExtractor(nn.Module):
         'resnet101' (default) → original ResNet-101 extractor
         'medsam'              → MedSAM ViT-B extractor (this file)
         'autoencoder'         → ConvAutoencoder encoder pretrained on IU X-Ray (this file)
+        'mae'                 → MAE-pretrained ViT-Small/16 extractor (this file)
 
     Interface is identical:  forward(images) → (att_feats, fc_feats)
     """
@@ -240,6 +352,9 @@ class VisualExtractor(nn.Module):
         elif extractor_name == 'autoencoder':
             self.extractor = AutoencoderVisualExtractor(args)
             self.d_vf = AE_D_VF
+        elif extractor_name == 'mae':
+            self.extractor = MAEVisualExtractor(args)
+            self.d_vf = MAE_D_VF
         else:
             self.extractor = ResNetVisualExtractor(args)
             self.d_vf = getattr(args, 'd_vf', 2048)

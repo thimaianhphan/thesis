@@ -15,6 +15,8 @@ Stage 2 (main training):
 Visual extractor:
   - 'resnet101' (default) : original R2Gen backbone, d_vf=2048
   - 'medsam'              : MedSAM ViT-B, d_vf=256
+  - 'autoencoder'         : ConvAutoencoder encoder pretrained on IU X-Ray, d_vf=256
+  - 'mae'                 : MAE-pretrained ViT-Small/16 (medical_mae, CheXpert+NIH), d_vf=384
 
 KG node discovery:
   - Hardcoded anatomy/finding word lists (see modules/knowledge_graph.py).
@@ -55,19 +57,21 @@ def parse_agrs():
 
     # Visual extractor
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
-                        choices=['resnet101', 'medsam', 'resnet50', 'autoencoder'],
-                        help="'resnet101' (d_vf=2048), 'medsam' (d_vf=256), or 'autoencoder' (d_vf=256)")
+                        choices=['resnet101', 'medsam', 'resnet50', 'autoencoder', 'mae'],
+                        help="'resnet101' (d_vf=2048), 'medsam' (d_vf=256), 'autoencoder' (d_vf=256), or 'mae' (d_vf=384)")
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True)
     parser.add_argument('--autoencoder_ckpt', type=str, default='artifacts/ae_encoder.pth',
                         help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
+    parser.add_argument('--mae_ckpt', type=str, default='artifacts/vit_small_mae.pth',
+                        help='path to MAE-pretrained ViT-S/16 checkpoint (required when --visual_extractor mae).')
     parser.add_argument('--freeze_visual_extractor', action='store_true',
-                        help='Freeze visual extractor backbone (useful for MedSAM/autoencoder).')
+                        help='Freeze visual extractor backbone (useful for MedSAM/autoencoder/MAE).')
 
     # Transformer
     parser.add_argument('--d_model', type=int, default=512)
     parser.add_argument('--d_ff', type=int, default=512)
     parser.add_argument('--d_vf', type=int, default=2048,
-                        help='Patch feature dim. Set 256 for MedSAM/autoencoder, 2048 for ResNet.')
+                        help='Patch feature dim. Set 256 for MedSAM/autoencoder, 384 for MAE, 2048 for ResNet.')
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--num_layers', type=int, default=3)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -107,7 +111,7 @@ def parse_agrs():
     # Optimisation
     parser.add_argument('--optim', type=str, default='Adam')
     parser.add_argument('--lr_ve', type=float, default=5e-5,
-                        help='LR for visual extractor. Use 1e-5 for MedSAM.')
+                        help='LR for visual extractor. Use 1e-5 for MedSAM/MAE.')
     parser.add_argument('--lr_ed', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-5)
     parser.add_argument('--amsgrad', type=bool, default=True)
@@ -145,8 +149,14 @@ def parse_agrs():
         print(f"[WARNING] visual_extractor={args.visual_extractor} but d_vf={args.d_vf}. "
               f"Forcing d_vf=256.")
         args.d_vf = 256
+    if args.visual_extractor == 'mae' and args.d_vf != 384:
+        print(f"[WARNING] visual_extractor=mae but d_vf={args.d_vf}. "
+              f"Forcing d_vf=384.")
+        args.d_vf = 384
     if args.visual_extractor == 'autoencoder' and not args.autoencoder_ckpt:
         raise ValueError("--visual_extractor autoencoder requires --autoencoder_ckpt <path to ae_encoder.pth>")
+    if args.visual_extractor == 'mae' and not args.mae_ckpt:
+        raise ValueError("--visual_extractor mae requires --mae_ckpt <path to MAE ViT-S/16 checkpoint>")
     if args.visual_extractor == 'resnet101' and args.d_vf == 256:
         print(f"[WARNING] visual_extractor=resnet101 but d_vf=256. "
               f"Forcing d_vf=2048.")

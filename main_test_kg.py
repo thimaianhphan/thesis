@@ -68,12 +68,14 @@ def parse_agrs():
 
     # Model settings (for visual extractor)
     parser.add_argument('--visual_extractor', type=str, default='resnet101',
-                        choices=['resnet101', 'resnet50', 'medsam', 'autoencoder'],
+                        choices=['resnet101', 'resnet50', 'medsam', 'autoencoder', 'mae'],
                         help='the visual extractor to be used.')
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True,
                         help='whether to load the pretrained visual extractor')
     parser.add_argument('--autoencoder_ckpt', type=str, default=None,
                         help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
+    parser.add_argument('--mae_ckpt', type=str, default=None,
+                        help='path to MAE-pretrained ViT-S/16 checkpoint (required when --visual_extractor mae).')
     parser.add_argument('--freeze_visual_extractor', action='store_true',
                         help='Freeze visual extractor backbone.')
 
@@ -177,8 +179,14 @@ def parse_agrs():
         print(f"[WARNING] visual_extractor={args.visual_extractor} but d_vf={args.d_vf}. "
               f"Forcing d_vf=256.")
         args.d_vf = 256
+    if args.visual_extractor == 'mae' and args.d_vf != 384:
+        print(f"[WARNING] visual_extractor=mae but d_vf={args.d_vf}. "
+              f"Forcing d_vf=384.")
+        args.d_vf = 384
     if args.visual_extractor == 'autoencoder' and not args.autoencoder_ckpt:
         raise ValueError("--visual_extractor autoencoder requires --autoencoder_ckpt <path to ae_encoder.pth>")
+    if args.visual_extractor == 'mae' and not args.mae_ckpt:
+        raise ValueError("--visual_extractor mae requires --mae_ckpt <path to MAE ViT-S/16 checkpoint>")
 
     return args
 
