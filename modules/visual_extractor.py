@@ -256,7 +256,7 @@ class MAEVisualExtractor(nn.Module):
         )
 
         print(f"[MAE] Loading ViT-S/16 encoder weights from {ckpt_path}...")
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
 
         encoder_state = {
