@@ -17,12 +17,12 @@ Visual extractor:
   - 'medsam'              : MedSAM ViT-B, d_vf=256
 
 KG node discovery:
-  - BiomedCLIP text encoder types corpus-extracted terms into
-    {anatomy, abnormal, normal} — replaces hardcoded word lists.
+  - Hardcoded anatomy/finding word lists (see modules/knowledge_graph.py).
+    An earlier BiomedCLIP-based dynamic typing scheme was tried and reverted
+    after it hurt report-generation quality.
 
-Contrastive Attention (optional, --use_contrastive_attention):
-  - Normality pool built using kg_builder.is_normal_report()
-    (BiomedCLIP-based) instead of keyword heuristics.
+Note: Contrastive Attention (Liu et al. ACL 2021) was tried and removed —
+it also hurt report-generation quality.
 """
 
 import functools
@@ -58,7 +58,7 @@ def parse_agrs():
                         choices=['resnet101', 'medsam', 'resnet50', 'autoencoder'],
                         help="'resnet101' (d_vf=2048), 'medsam' (d_vf=256), or 'autoencoder' (d_vf=256)")
     parser.add_argument('--visual_extractor_pretrained', type=bool, default=True)
-    parser.add_argument('--autoencoder_ckpt', type=str, default=None,
+    parser.add_argument('--autoencoder_ckpt', type=str, default='artifacts/ae_encoder.pth',
                         help='path to ae_encoder.pth (required when --visual_extractor autoencoder).')
     parser.add_argument('--freeze_visual_extractor', action='store_true',
                         help='Freeze visual extractor backbone (useful for MedSAM/autoencoder).')
@@ -138,24 +138,6 @@ def parse_agrs():
     parser.add_argument('--kg_pretrain_lr', type=float, default=1e-4)
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3)
 
-    # BiomedCLIP KG typing
-    parser.add_argument('--kg_min_term_freq', type=int, default=5,
-                        help='Min document frequency for a corpus term to be a KG node.')
-    parser.add_argument('--kg_max_nodes', type=int, default=150,
-                        help='Hard cap on total KG nodes.')
-    parser.add_argument('--biomedclip_device', type=str,
-                        default='cuda' if __import__('torch').cuda.is_available() else 'cpu',
-                        help="Device for BiomedCLIP during graph build / CA pool. "
-                             "Use 'cuda' to speed up node typing on large corpora.")
-
-    # ==================== Contrastive Attention args ====================
-    parser.add_argument('--use_contrastive_attention', action='store_true',
-                        help='Enable Contrastive Attention (Liu et al. ACL 2021).')
-    parser.add_argument('--ca_pool_size', type=int, default=100,
-                        help='Normality pool size. 100 for IU X-Ray, 500+ for MIMIC.')
-    parser.add_argument('--ca_num_rounds', type=int, default=3,
-                        help='Aggregate Attention rounds (paper uses 3).')
-
     args = parser.parse_args()
 
     # --- Consistency check ---
@@ -174,14 +156,11 @@ def parse_agrs():
 
 
 def build_kg_optimizer(args, model):
-    """Separate LR groups for visual extractor, KG encoder, CA, and the rest."""
+    """Separate LR groups for visual extractor, KG encoder, and the rest."""
     ve_ids = set(map(id, model.visual_extractor.parameters()))
     kg_ids = set(map(id, model.encoder_decoder.kg_encoder.parameters()))
-    ca_ids = set()
-    if model.encoder_decoder.contrastive_attn is not None:
-        ca_ids = set(map(id, model.encoder_decoder.contrastive_attn.parameters()))
 
-    special_ids = ve_ids | kg_ids | ca_ids
+    special_ids = ve_ids | kg_ids
     ed_params = [p for p in model.parameters() if id(p) not in special_ids]
 
     param_groups = [
@@ -189,11 +168,6 @@ def build_kg_optimizer(args, model):
         {'params': ed_params,                                  'lr': args.lr_ed},
         {'params': list(model.encoder_decoder.kg_encoder.parameters()), 'lr': args.lr_ed},
     ]
-    if ca_ids:
-        param_groups.append({
-            'params': list(model.encoder_decoder.contrastive_attn.parameters()),
-            'lr': args.lr_ed,
-        })
 
     optimizer = getattr(torch.optim, args.optim)(
         param_groups,
@@ -253,42 +227,6 @@ def pretrain_kg_classifier(model, train_dataloader, args, device):
     print("=" * 60)
 
 
-def build_ca_pool(model, train_dataloader, args, device):
-    """
-    Build the Contrastive Attention normality pool.
-
-    Uses kg_builder.is_normal_report() (BiomedCLIP-based) to identify normal
-    training images instead of keyword heuristics.
-    Ref: Liu et al. (ACL Findings 2021).
-    """
-    ca = model.encoder_decoder.contrastive_attn
-    if ca is None:
-        return
-
-    print("=" * 60)
-    print("[CA] Building normality pool")
-    print(f"  Pool size        : {args.ca_pool_size}")
-    print(f"  Agg rounds       : {args.ca_num_rounds}")
-    print(f"  Normality scorer : BiomedCLIP (kg_builder.is_normal_report)")
-    print(f"  Ref              : Liu et al. (ACL Findings 2021)")
-    print("=" * 60)
-
-    # Expose the kg_builder that was used to build the graph
-    kg_builder = model.encoder_decoder.kg_builder
-
-    ca.build_normality_pool(
-        visual_extractor=model.visual_extractor,
-        dataloader=train_dataloader,
-        dataset_name=args.dataset_name,
-        ann_path=args.ann_path,
-        device=device,
-        max_pool_size=args.ca_pool_size,
-        kg_builder=kg_builder,          # ← BiomedCLIP-based normality scoring
-    )
-    print("[CA] Normality pool ready.")
-    print("=" * 60)
-
-
 def main():
     args = parse_agrs()
 
@@ -303,8 +241,6 @@ def main():
     )
     print(f"[Main] Device: {device}")
     print(f"[Main] Visual extractor : {args.visual_extractor}  (d_vf={args.d_vf})")
-    print(f"[Main] BiomedCLIP device: {args.biomedclip_device}")
-    print(f"[Main] Contrastive Attn : {args.use_contrastive_attention}")
 
     # Tokenizer + dataloaders
     tokenizer = Tokenizer(args)
@@ -313,16 +249,12 @@ def main():
     test_dataloader  = R2DataLoader(args, tokenizer, split='test',  shuffle=False)
 
     # ---- Build model ----
-    # KnowledgeGraphBuilder inside KGEncoderDecoder.__init__ already runs
-    # Phase 1 (corpus scan) + Phase 2 (BiomedCLIP typing) using args.biomedclip_device.
+    # KnowledgeGraphBuilder inside KGEncoderDecoder.__init__ scans the corpus
+    # and types terms via the hardcoded entity lists in modules/knowledge_graph.py.
     # This happens once here before any GPU memory is allocated for training.
     model = R2GenKGModel(args, tokenizer)
     print(model)
     model = model.to(device)
-
-    # ---- Build CA normality pool (before Stage 1 so pool uses clean backbone) ----
-    if args.use_contrastive_attention:
-        build_ca_pool(model, train_dataloader, args, device)
 
     # ---- Stage 1: KG pretraining ----
     pretrain_kg_classifier(model, train_dataloader, args, device)

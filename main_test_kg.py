@@ -170,12 +170,6 @@ def parse_agrs():
     parser.add_argument('--kg_co_occur_threshold', type=int, default=3, help='.')
     parser.add_argument('--kg_loss_weight', type=float, default=0.1, help='.')
 
-    # Contrastive Attention args
-    parser.add_argument('--use_contrastive_attention', action='store_true',
-                        help='Enable Contrastive Attention.')
-    parser.add_argument('--ca_pool_size', type=int, default=100, help='.')
-    parser.add_argument('--ca_num_rounds', type=int, default=3, help='.')
-
     args = parser.parse_args()
 
     # --- Consistency check (must match training config) ---
@@ -479,22 +473,6 @@ def main():
 
     # build KG-enhanced model
     model = R2GenKGModel(args, tokenizer)
-
-    # Build CA normality pool if enabled (needs training dataloader)
-    if getattr(args, 'use_contrastive_attention', False):
-        ca = model.encoder_decoder.contrastive_attn
-        if ca is not None:
-            train_dataloader = R2DataLoader(args, tokenizer, split='train', shuffle=False)
-            device = torch.device('cuda:0' if args.n_gpu > 0 and torch.cuda.is_available() else 'cpu')
-            model = model.to(device)
-            ca.build_normality_pool(
-                visual_extractor=model.visual_extractor,
-                dataloader=train_dataloader,
-                dataset_name=args.dataset_name,
-                ann_path=args.ann_path,
-                device=device,
-            )
-            model = model.cpu()
 
     # get function handles of loss and metrics
     criterion = compute_loss

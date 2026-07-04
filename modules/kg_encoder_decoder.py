@@ -1,9 +1,9 @@
 """
-R2Gen + Knowledge Graph + Contrastive Attention (v2+CA)
+R2Gen + Knowledge Graph (v2)
 
 Data flow:
   Image → ResNet → fc_feats → KG Encoder (GCN + image gate) → kg_feats [B,N,D]
-                 → att_feats → [CA] → Transformer Encoder → encoder_out
+                 → att_feats → Transformer Encoder → encoder_out
                                                                     ↓
   Decoder: self_attn(+MCLN) → visual_cross_attn(+MCLN) → KG_cross_attn(gated) → FFN(+MCLN)
                                                                     ↓
@@ -11,6 +11,9 @@ Data flow:
 
 KG fuses at DECODER level (KiUT-style), NOT encoder level.
 No DCG bidirectional cross-attention.
+
+Contrastive Attention (Liu et al. ACL 2021) was tried and removed — it hurt
+report-generation quality.
 """
 
 import torch
@@ -31,7 +34,6 @@ from .knowledge_graph import (
     KnowledgeGraphBuilder, KnowledgeGraphEncoder, KGCrossAttention,
     KGMultiLabelClassifier, KGAlignmentLoss
 )
-from .contrastive_attention import ContrastiveAttention
 
 
 # =============================================================================
@@ -150,7 +152,7 @@ class KGEncoderDecoder(AttModel):
             args.ann_path, args.dataset_name,
             co_occur_threshold=getattr(args, 'kg_co_occur_threshold', 3),
         )
-        node_list, node_types, adjacency, node2idx, node_embs = kg_builder.build(split='train')
+        node_list, node_types, adjacency, node2idx = kg_builder.build(split='train')
         self.node_list = node_list
         self.node_types = node_types
         self.node2idx = node2idx
@@ -163,7 +165,6 @@ class KGEncoderDecoder(AttModel):
         self.kg_encoder = KnowledgeGraphEncoder(
             num_nodes=self.num_kg_nodes, node_types=node_types,
             d_model=args.d_model, d_visual=d_visual,
-            node_init_emb=node_embs,
             num_gcn_layers=getattr(args, 'kg_num_gcn_layers', 1),
             dropout=args.dropout,
             gcn_residual_alpha=getattr(args, 'kg_gcn_alpha', 0.2),
@@ -173,26 +174,11 @@ class KGEncoderDecoder(AttModel):
         self.logit = nn.Linear(args.d_model, tgt_vocab)
         self.kg_loss_weight = getattr(args, 'kg_loss_weight', 0.1)
 
-        # Contrastive Attention (optional)
-        use_ca = getattr(args, 'use_contrastive_attention', False)
-        if use_ca:
-            self.contrastive_attn = ContrastiveAttention(
-                d_model=args.d_model,
-                d_fc = d_visual,
-                pool_size=getattr(args, 'ca_pool_size', 100),
-                num_agg_rounds=getattr(args, 'ca_num_rounds', 3),
-                dropout=args.dropout,
-            )
-        else:
-            self.contrastive_attn = None
-
     def init_hidden(self, bsz):
         return []
 
     def _prepare_feature(self, fc_feats, att_feats, att_masks):
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks)
-        if self.contrastive_attn is not None:
-            att_feats = self.contrastive_attn(att_feats, fc_feats)
         memory = self.model.encode(att_feats, att_masks)
         return fc_feats[..., :1], att_feats[..., :1], memory, att_masks
 
@@ -215,8 +201,6 @@ class KGEncoderDecoder(AttModel):
     def _forward(self, fc_feats, att_feats, seq, att_masks=None):
         self._cached_fc_feats = fc_feats  # used by kg_classifier in trainer
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks, seq)
-        if self.contrastive_attn is not None:
-            att_feats = self.contrastive_attn(att_feats, fc_feats)
         kg_feats = self.kg_encoder(self.adj, fc_feats)
         out = self.model(att_feats, seq, att_masks, seq_mask, kg_feats)
         outputs = F.log_softmax(self.logit(out), dim=-1)

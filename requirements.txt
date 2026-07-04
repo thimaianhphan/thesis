@@ -1,4 +1,3 @@
-open_clip_torch 
-opencv-python-headless 
+opencv-python-headless
 pycocoevalcap 
 datasets
