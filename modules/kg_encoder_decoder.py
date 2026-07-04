@@ -42,14 +42,14 @@ from .knowledge_graph import (
 
 class KGDecoderLayer(nn.Module):
     def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout,
-                 rm_num_slots, rm_d_model, num_heads=8):
+                 memory_dim, num_heads=8):
         super().__init__()
         self.d_model = d_model
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
         self.sublayer = clones(
-            ConditionalSublayerConnection(d_model, dropout, rm_num_slots, rm_d_model), 3
+            ConditionalSublayerConnection(d_model, dropout, memory_dim), 3
         )
         # KG cross-attention uses 4 heads (not the main Transformer's 8)
         self.kg_cross_attn = KGCrossAttention(d_model, num_heads=4, dropout=dropout)
@@ -111,17 +111,20 @@ class KGEncoderDecoder(AttModel):
             rm = ExpertMemory(
                 num_slots=self.rm_num_slots, d_model=self.rm_d_model,
                 num_heads=self.rm_num_heads, dropout=self.dropout,
+                causal_query_mean=getattr(self.args, 'expert_query_causal_mean', False),
             )
+            memory_dim = rm.memory_dim
         else:
             rm = RelationalMemory(
                 num_slots=self.rm_num_slots, d_model=self.rm_d_model,
                 num_heads=self.rm_num_heads,
             )
+            memory_dim = self.rm_num_slots * self.rm_d_model
         model = KGTransformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
             KGDecoder(
                 KGDecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout,
-                               self.rm_num_slots, self.rm_d_model, self.num_heads),
+                               memory_dim, self.num_heads),
                 self.num_layers
             ),
             lambda x: x,

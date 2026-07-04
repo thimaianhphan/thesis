@@ -165,6 +165,9 @@ def parse_agrs():
     # Architecture switches (must match training config)
     parser.add_argument('--use_expert_memory', action='store_true',
                         help='Use ExpertMemory instead of RelationalMemory (must match training).')
+    parser.add_argument('--expert_query_causal_mean', action='store_true',
+                        help='Must match training: ExpertMemory queries experts with the causal '
+                             'running mean of token embeddings instead of raw per-token embedding.')
 
     # KG args (must match training config)
     parser.add_argument('--kg_num_gcn_layers', type=int, default=1, help='.')

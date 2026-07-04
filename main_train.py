@@ -86,6 +86,9 @@ def parse_agrs():
     # Architecture switches
     parser.add_argument('--use_expert_memory', action='store_true',
                         help='replace RelationalMemory with image-conditioned ExpertMemory.')
+    parser.add_argument('--expert_query_causal_mean', action='store_true',
+                        help='ExpertMemory queries experts with the causal running mean of '
+                             'token embeddings instead of the raw per-token embedding.')
 
     # Others
     parser.add_argument('--seed', type=int, default=9233, help='.')

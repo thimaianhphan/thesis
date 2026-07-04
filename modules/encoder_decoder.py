@@ -116,13 +116,13 @@ class Decoder(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout, rm_num_slots, rm_d_model):
+    def __init__(self, d_model, self_attn, src_attn, feed_forward, dropout, memory_dim):
         super(DecoderLayer, self).__init__()
         self.d_model = d_model
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(ConditionalSublayerConnection(d_model, dropout, rm_num_slots, rm_d_model), 3)
+        self.sublayer = clones(ConditionalSublayerConnection(d_model, dropout, memory_dim), 3)
 
     def forward(self, x, hidden_states, src_mask, tgt_mask, memory):
         m = hidden_states
@@ -132,9 +132,9 @@ class DecoderLayer(nn.Module):
 
 
 class ConditionalSublayerConnection(nn.Module):
-    def __init__(self, d_model, dropout, rm_num_slots, rm_d_model):
+    def __init__(self, d_model, dropout, memory_dim):
         super(ConditionalSublayerConnection, self).__init__()
-        self.norm = ConditionalLayerNorm(d_model, rm_num_slots, rm_d_model)
+        self.norm = ConditionalLayerNorm(d_model, memory_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer, memory):
@@ -142,19 +142,18 @@ class ConditionalSublayerConnection(nn.Module):
 
 
 class ConditionalLayerNorm(nn.Module):
-    def __init__(self, d_model, rm_num_slots, rm_d_model, eps=1e-6):
+    def __init__(self, d_model, memory_dim, eps=1e-6):
         super(ConditionalLayerNorm, self).__init__()
         self.gamma = nn.Parameter(torch.ones(d_model))
         self.beta = nn.Parameter(torch.zeros(d_model))
-        self.rm_d_model = rm_d_model
-        self.rm_num_slots = rm_num_slots
+        self.memory_dim = memory_dim
         self.eps = eps
 
-        self.mlp_gamma = nn.Sequential(nn.Linear(rm_num_slots * rm_d_model, d_model),
+        self.mlp_gamma = nn.Sequential(nn.Linear(memory_dim, d_model),
                                        nn.ReLU(inplace=True),
-                                       nn.Linear(rm_d_model, rm_d_model))
+                                       nn.Linear(d_model, d_model))
 
-        self.mlp_beta = nn.Sequential(nn.Linear(rm_num_slots * rm_d_model, d_model),
+        self.mlp_beta = nn.Sequential(nn.Linear(memory_dim, d_model),
                                       nn.ReLU(inplace=True),
                                       nn.Linear(d_model, d_model))
 
@@ -304,27 +303,40 @@ class RelationalMemory(nn.Module):
 class ExpertMemory(nn.Module):
     """
     Replaces RelationalMemory. Learnable expert tokens cross-attend to the
-    image encoder output, producing an image-conditioned memory tensor that
-    drives the ConditionalLayerNorm in each decoder sub-layer.
+    image encoder output, producing E image-conditioned expert tokens. Each
+    decoder position then queries those experts with its own token embedding
+    (or, optionally, the causal running mean of embeddings up to that
+    position), so the memory fed to ConditionalLayerNorm varies per position
+    instead of being broadcast identically across the whole sequence.
 
-    Output shape: [B, T, num_slots * d_model]  — identical to RelationalMemory,
-    so ConditionalLayerNorm requires no changes.
+    Output shape: [B, T, d_model]  — one pooled, query-conditioned expert
+    vector per position (no longer num_slots * d_model; ConditionalLayerNorm
+    is parameterised by memory_dim to match).
 
     Motivation: RelationalMemory initialises from an identity matrix and
     updates via GRU gates on target tokens — it contains no image information
     until the decoder implicitly learns it through cross-attention. Expert
     tokens instead explicitly distil the image into a small set of structured
-    summaries before decoding begins, giving the MCLN image-grounded scale
-    and shift parameters from step 0.
+    summaries before decoding begins. Broadcasting one static pooled summary
+    to every position collapses the per-word guidance METransformer relies
+    on and pushes the decoder toward templated output, so a second
+    cross-attention (query = token embedding, keys/values = experts) is used
+    to make memory position-dependent while staying fully parallel (one
+    attention op over T queries, no recurrence) and causal-safe (memory[t]
+    depends only on token t's own embedding, never future tokens).
 
-    Reference: METransformer (Wang et al., CVPR 2023) — expert tokens with
-    cross-attention to image patches achieve BLEU-4 ~0.310 on IU X-ray.
+    Reference: METransformer (Wang et al., CVPR 2023) — "each attended expert
+    token guides the cross-attention between input words and visual tokens";
+    expert tokens with cross-attention to image patches achieve BLEU-4 ~0.310
+    on IU X-ray.
     """
 
-    def __init__(self, num_slots, d_model, num_heads=8, dropout=0.1):
+    def __init__(self, num_slots, d_model, num_heads=8, dropout=0.1, causal_query_mean=False):
         super().__init__()
         self.num_slots = num_slots
         self.d_model = d_model
+        self.memory_dim = d_model
+        self.causal_query_mean = causal_query_mean
 
         self.expert_queries = nn.Parameter(torch.empty(1, num_slots, d_model))
         nn.init.normal_(self.expert_queries, std=0.02)
@@ -339,6 +351,10 @@ class ExpertMemory(nn.Module):
         )
         self.norm2 = LayerNorm(d_model)
 
+        # Per-position query attention: token embeddings query the experts.
+        self.query_attn = MultiHeadedAttention(num_heads, d_model)
+        self.norm3 = LayerNorm(d_model)
+
         for m in self.ffn.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -350,24 +366,33 @@ class ExpertMemory(nn.Module):
 
     def forward(self, inputs, dummy_memory, image_enc=None):
         """
-        inputs     : [B, T, d_model]  target token embeddings (T used for broadcast)
+        inputs     : [B, T, d_model]  target token embeddings
         dummy_memory : ignored
         image_enc  : [B, N, d_model]  transformer encoder output
 
-        Returns    : [B, T, num_slots * d_model]
+        Returns    : [B, T, d_model]
         """
         B, T, _ = inputs.shape
 
         if image_enc is None:
-            return torch.zeros(B, T, self.num_slots * self.d_model,
+            return torch.zeros(B, T, self.memory_dim,
                                device=inputs.device, dtype=inputs.dtype)
 
         e = self.expert_queries.expand(B, -1, -1)               # [B, E, d_model]
         e = self.norm1(e + self.cross_attn(e, image_enc, image_enc))
         e = self.norm2(e + self.ffn(e))                         # [B, E, d_model]
 
-        e_flat = e.reshape(B, self.num_slots * self.d_model)    # [B, E*d_model]
-        return e_flat.unsqueeze(1).expand(-1, T, -1)            # [B, T, E*d_model]
+        if self.causal_query_mean:
+            # Causal running mean of token embeddings ("what's been said so
+            # far"), computed as a parallel cumsum — still O(1) per position,
+            # no Python loop over T.
+            denom = torch.arange(1, T + 1, device=inputs.device, dtype=inputs.dtype).view(1, T, 1)
+            query = torch.cumsum(inputs, dim=1) / denom
+        else:
+            query = inputs
+
+        memory = self.norm3(self.query_attn(query, e, e))       # [B, T, d_model]
+        return memory
 
 
 class EncoderDecoder(AttModel):
@@ -381,16 +406,19 @@ class EncoderDecoder(AttModel):
             rm = ExpertMemory(
                 num_slots=self.rm_num_slots, d_model=self.rm_d_model,
                 num_heads=self.rm_num_heads, dropout=self.dropout,
+                causal_query_mean=getattr(self.args, 'expert_query_causal_mean', False),
             )
+            memory_dim = rm.memory_dim
         else:
             rm = RelationalMemory(
                 num_slots=self.rm_num_slots, d_model=self.rm_d_model,
                 num_heads=self.rm_num_heads,
             )
+            memory_dim = self.rm_num_slots * self.rm_d_model
         model = Transformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
             Decoder(
-                DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout, self.rm_num_slots, self.rm_d_model),
+                DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout, memory_dim),
                 self.num_layers),
             lambda x: x,
             nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position)),
