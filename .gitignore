@@ -144,5 +144,4 @@ cython_debug/
 data/iu_xray/
 data/mimic_cxr/
 
-#artifacts
-artifacts/vit_small_mae.pth
+diagnostics/DIAGNOSTIC_REPORT.md

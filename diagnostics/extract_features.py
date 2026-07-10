@@ -23,6 +23,16 @@ View handling (Phase 0.2): IU X-ray studies have 2 images; labels are per-study.
 both encoders, needs no view metadata). --view first restricts to image index 0
 (≈ frontal under R2Gen's ordering convention, per-study unverified).
 
+Part B Task 1 (spatial probe): for --encoder ae, ALSO derives three parameter-free
+poolings of the pre-GAP [N,256,14,14] map -- gap (mean, == the original X, baseline
+anchor), gmp (max), lse (log-sum-exp smooth-max, temperature --lse_tau, default
+1.0). All three come from the dispatcher's own att_feats (the flattened spatial
+tokens already fed to RRG's cross-attention), so gap is guaranteed numerically
+identical to the pre-existing X and nothing about the ResNet path changes. Saved
+as X (gap, unchanged key), X_gmp, X_lse. --save_spatial additionally dumps the
+full [N,256,14,14] map as float16 for the attention-pool probe (off by default --
+train ~415MB, val ~60MB).
+
 Labels: we save BOTH the RAW pipeline labels (y_raw, bit-identical to Stage-1
 get_kg_labels) AND the negation-aware labels (y_negaware) so the probe can be run
 either way without re-extraction. Phase 0.1 found ~71% of RAW abnormal positives
@@ -101,6 +111,38 @@ def _fc_feats(ve, batch):
     return fc
 
 
+def lse_pool(att_feats, tau=1.0):
+    """Smooth-max pooling over the patch dimension. att_feats: [B, P, D] -> [B, D].
+    LSE(x;tau) = max(x) + tau*log(mean(exp((x-max(x))/tau))), numerically stable
+    via the max-subtraction trick. tau->0 approaches max pooling (gmp); tau->inf
+    approaches mean pooling (gap). Ref: Pinheiro & Collobert 2015-style LSE
+    pooling for weakly-supervised localization."""
+    m = att_feats.amax(dim=1, keepdim=True)                      # [B,1,D]
+    lse = m + tau * (att_feats - m).div(tau).exp().mean(dim=1, keepdim=True).log()
+    return lse.squeeze(1)                                        # [B,D]
+
+
+def spatial_pools(att_feats, fc_feats, tau=1.0):
+    """Given dispatcher outputs, return dict of parameter-free poolings [B,D].
+    'gap' reuses fc_feats directly (the value that actually feeds RRG) rather
+    than recomputing from att_feats, so it is guaranteed identical to the
+    pre-existing baseline."""
+    return {
+        'gap': fc_feats,
+        'gmp': att_feats.amax(dim=1),
+        'lse': lse_pool(att_feats, tau=tau),
+    }
+
+
+def reconstruct_map(att_feats):
+    """Invert the dispatcher's flatten(2).transpose(1,2): att_feats [B,P,D] ->
+    [B,D,H,W] with H=W=sqrt(P). Exact (permutation only, no information loss)."""
+    B, P, D = att_feats.shape
+    side = int(round(P ** 0.5))
+    assert side * side == P, f"non-square patch grid: P={P}"
+    return att_feats.transpose(1, 2).reshape(B, D, side, side)
+
+
 def extract(args):
     import torch
     from PIL import Image
@@ -128,8 +170,10 @@ def extract(args):
     ve = ve.to(device)
     print(f"[extract] encoder={args.encoder} D={D} split={args.split} view={args.view} device={device}")
 
+    want_spatial = args.encoder == 'ae'  # gmp/lse/(map) only asked for on the AE path
     studies = ann[args.split]
-    feats, y_raw, y_neg, ids, paths, views = [], [], [], [], [], []
+    feats, feats_gmp, feats_lse, maps_f16 = [], [], [], []
+    y_raw, y_neg, ids, paths, views = [], [], [], []
     buf_img, buf_meta = [], []
 
     def flush():
@@ -137,9 +181,20 @@ def extract(args):
             return
         batch = torch.stack(buf_img, 0).to(device)
         with torch.no_grad():
-            fc = _fc_feats(ve, batch).cpu().numpy()
-        assert fc.shape[1] == D, f"expected D={D}, got {fc.shape[1]}"
-        feats.append(fc)
+            if want_spatial:
+                att, fc = ve(batch)
+                pools = spatial_pools(att, fc, tau=args.lse_tau)
+                fc_np = pools['gap'].cpu().numpy()
+                gmp_np = pools['gmp'].cpu().numpy()
+                lse_np = pools['lse'].cpu().numpy()
+                feats_gmp.append(gmp_np)
+                feats_lse.append(lse_np)
+                if args.save_spatial:
+                    maps_f16.append(reconstruct_map(att).to(torch.float16).cpu().numpy())
+            else:
+                fc_np = _fc_feats(ve, batch).cpu().numpy()
+        assert fc_np.shape[1] == D, f"expected D={D}, got {fc_np.shape[1]}"
+        feats.append(fc_np)
         for (iid, rep, rp, v) in buf_meta:
             y_raw.append(raw_label(rep))
             y_neg.append(neg_label(rep))
@@ -170,14 +225,22 @@ def extract(args):
     y_neg = np.stack(y_neg).astype(np.float32)
     assert X.shape[0] == y_raw.shape[0] == len(ids), "row misalignment!"
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    np.savez_compressed(
-        args.out,
+    save_kwargs = dict(
         X=X, y_raw=y_raw, y_negaware=y_neg,
         ids=np.array(ids), image_paths=np.array(paths), views=np.array(views),
         node_list=np.array(node_list), node_types=np.array(node_types),
         encoder=args.encoder, split=args.split, view=args.view, D=D,
     )
-    print(f"[extract] saved {args.out}: X={X.shape} y={y_raw.shape} "
+    if want_spatial:
+        X_gmp = np.concatenate(feats_gmp, 0).astype(np.float32)
+        X_lse = np.concatenate(feats_lse, 0).astype(np.float32)
+        assert X_gmp.shape == X.shape and X_lse.shape == X.shape
+        save_kwargs.update(X_gmp=X_gmp, X_lse=X_lse, lse_tau=args.lse_tau)
+        if args.save_spatial:
+            save_kwargs['map_f16'] = np.concatenate(maps_f16, 0)  # [N,D,side,side] float16
+    np.savez_compressed(args.out, **save_kwargs)
+    extra = " + gmp/lse" + ("+map" if (want_spatial and args.save_spatial) else "") if want_spatial else ""
+    print(f"[extract] saved {args.out}: X={X.shape}{extra} y={y_raw.shape} "
           f"(missing images skipped: {n_missing})")
 
 
@@ -236,6 +299,34 @@ def smoke():
         assert y_neg[0, ei] == 0.0, "negaware: negated effusion should be dropped"
         assert y_raw[2, ei] == 1.0 and y_neg[2, ei] == 1.0, "real effusion kept in both"
     print("  toy id->label mapping, per-image expansion, negation drop  OK")
+
+    # ---- Task 1: spatial pooling (gap/gmp/lse) + map reconstruction ----
+    print("[smoke] spatial pooling (gap/gmp/lse) ...")
+    B, C, H, W = 8, 256, 14, 14
+    fmap = torch.randn(B, C, H, W)
+    att = fmap.flatten(2).transpose(1, 2)          # [B,196,256], mirrors the dispatcher
+    fc = fmap.mean(dim=(2, 3))                     # [B,256], mirrors AutoencoderVisualExtractor
+    pools = spatial_pools(att, fc, tau=1.0)
+    assert pools['gap'].shape == (B, C) and pools['gmp'].shape == (B, C) and pools['lse'].shape == (B, C)
+    manual_gap = fmap.mean(dim=(2, 3))
+    assert torch.allclose(pools['gap'], manual_gap, atol=1e-6), "gap must equal manual mean(-1,-2)"
+    manual_gmp = fmap.amax(dim=(2, 3))
+    assert torch.allclose(pools['gmp'], manual_gmp, atol=1e-6), "gmp must equal manual amax(-1,-2)"
+    # LSE must lie between mean and max at every entry (it's a smooth max)
+    assert (pools['lse'] >= manual_gap - 1e-4).all(), "lse should be >= mean"
+    assert (pools['lse'] <= manual_gmp + 1e-4).all(), "lse should be <= max"
+    # tau -> large approaches mean; tau -> small approaches max
+    lse_bigtau = lse_pool(att, tau=1000.0)
+    lse_smalltau = lse_pool(att, tau=0.01)
+    assert torch.allclose(lse_bigtau, manual_gap, atol=1e-2), "large tau should approach mean"
+    assert torch.allclose(lse_smalltau, manual_gmp, atol=1e-1), "small tau should approach max"
+    print(f"  gap/gmp/lse shapes {tuple(pools['gap'].shape)}  gap==mean OK  gmp==max OK  "
+          f"lse in [mean,max] OK  tau limits OK")
+
+    recon = reconstruct_map(att)
+    assert torch.allclose(recon, fmap, atol=1e-6), "reconstruct_map must invert flatten+transpose exactly"
+    print(f"  reconstruct_map: {tuple(att.shape)} -> {tuple(recon.shape)}  exact match to original map  OK")
+
     print("[smoke] PASS")
 
 
@@ -252,6 +343,11 @@ def main():
     ap.add_argument('--kg_co_occur_threshold', type=int, default=3)
     ap.add_argument('--batch_size', type=int, default=32)
     ap.add_argument('--device', default='cuda', choices=['cuda', 'cpu'])
+    ap.add_argument('--lse_tau', type=float, default=1.0,
+                    help='LSE-pool temperature (--encoder ae only). tau->0 ~ max, tau->inf ~ mean.')
+    ap.add_argument('--save_spatial', action='store_true',
+                    help='Also dump the full [N,256,14,14] map as float16 (--encoder ae only; '
+                         'needed for --pool attn in probe_and_rank.py). Off by default (large).')
     ap.add_argument('--smoke', action='store_true', help='run CPU synthetic smoke test and exit')
     args = ap.parse_args()
     if args.smoke:

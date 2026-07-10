@@ -33,6 +33,17 @@ Phase 0.1 found ~71% of RAW abnormal positives are negation artifacts, which wou
 teach the head to fire on negated findings. --labels raw reproduces the current
 Stage-1 target.
 
+Part B Task 2 (lambda_recon sweep, the controller): --rank_log PATH turns on a
+per-epoch effective-rank snapshot of the encoder's GAP-pooled bottleneck, computed
+under no_grad on a FIXED split (--rank_eval_split, default val -- same images every
+epoch, no augmentation, so snapshots are comparable across epochs). Uses the exact
+same effective_rank_stats() as diagnostics/probe_and_rank.py's gate table, imported
+from there rather than reimplemented, so there is no drift between "what Part A
+measured" and "what this logs mid-training". Tests the MSE-anchor hypothesis
+directly: does effective rank climb off its ~3.7 starting point as lambda_recon
+drops, or stay pinned (-> escalate to a from-scratch retrain, see Reserve in the
+Part B follow-up report).
+
 HANDOFF: real training loads real images + real ckpt + wants a GPU -> run on the
 remote machine. Locally only `--smoke` (synthetic tensors, CPU) is run; it does one
 forward+backward and asserts both loss terms are finite & non-zero and encoder conv
@@ -162,6 +173,39 @@ def build_train_transform():
     ])
 
 
+def build_eval_transform():
+    """Deterministic eval transform (no crop/flip) -- mirrors
+    diagnostics/extract_features.py exactly, so rank snapshots use the same
+    preprocessing as the Part A/Task 1 probes."""
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+
+@torch.no_grad()
+def compute_rank_snapshot(encoder, loader, device):
+    """One pass over a FIXED (no-shuffle, no-augmentation) loader; GAP-pool the
+    bottleneck; return (eff_rank, PR, top10_share, n_samples). Reuses
+    diagnostics/probe_and_rank.py's effective_rank_stats -- same metric
+    definition as Part A's gate table, imported not reimplemented."""
+    from probe_and_rank import effective_rank_stats  # diagnostics/ already on sys.path
+    was_training = encoder.training
+    encoder.eval()
+    feats = []
+    for images, _views, _labels in loader:
+        images = images.to(device)
+        z = encoder(images)
+        feats.append(z.mean(dim=(2, 3)).cpu().numpy())
+    if was_training:
+        encoder.train()
+    X = np.concatenate(feats, 0).astype(np.float64)
+    eff_rank, PR, top10 = effective_rank_stats(X)
+    return eff_rank, PR, top10, X.shape[0]
+
+
 def train(args):
     device = torch.device('cuda' if (args.device == 'cuda' and torch.cuda.is_available()) else 'cpu')
     node_list, node2idx, labeler = build_labeler(args.ann_path, args.labels, args.kg_co_occur_threshold)
@@ -182,6 +226,30 @@ def train(args):
     dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                                      num_workers=args.num_workers, drop_last=True)
 
+    log_f = None
+    log_rank = None
+    if args.rank_log:
+        rank_ds = IuxrayPerImage(args.ann_path, args.image_dir, args.rank_eval_split,
+                                 node_list, node2idx, labeler, build_eval_transform())
+        rank_loader = torch.utils.data.DataLoader(rank_ds, batch_size=args.batch_size,
+                                                  shuffle=False, num_workers=args.num_workers)
+        os.makedirs(os.path.dirname(os.path.abspath(args.rank_log)) or '.', exist_ok=True)
+        log_f = open(args.rank_log, 'w')
+        print(f"[train] rank logger ON -> {args.rank_log}  (fixed split={args.rank_eval_split}, "
+              f"n={len(rank_ds)})")
+
+        def log_rank(epoch):
+            eff_rank, pr, top10, n = compute_rank_snapshot(model.encoder, rank_loader, device)
+            rec = {'epoch': epoch, 'lambda_recon': args.lambda_recon, 'lambda_cls': args.lambda_cls,
+                   'eff_rank': eff_rank, 'PR': pr, 'top10_share': top10, 'n': n}
+            log_f.write(json.dumps(rec) + '\n')
+            log_f.flush()
+            print(f"[rank epoch {epoch:3d}] eff_rank={eff_rank:6.2f}  PR={pr:6.2f}  "
+                  f"top10_share={top10:.3f}  (n={n}, lambda_recon={args.lambda_recon})")
+            return rec
+
+        log_rank(0)  # pre-training baseline, before any combined-loss update
+
     mse = nn.MSELoss()
     focal = FocalBCEWithLogits(gamma=args.focal_gamma, alpha=args.focal_alpha)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -199,6 +267,11 @@ def train(args):
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item(); tot_r += l_recon.item(); tot_c += l_cls.item(); n += 1
         print(f"[epoch {epoch}/{args.epochs}] loss={tot/n:.4f}  recon={tot_r/n:.4f}  cls={tot_c/n:.4f}")
+        if log_rank is not None:
+            log_rank(epoch)
+
+    if log_f is not None:
+        log_f.close()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or '.', exist_ok=True)
     torch.save(model.encoder.state_dict(), args.out)   # drop-in for ae_encoder.pth
@@ -258,6 +331,63 @@ def smoke():
     print("[smoke] PASS (both loss terms finite & non-zero; enc/head/view grads flow)")
 
 
+def smoke_rank_logger():
+    """Task 2.2: (a) validate the effective-rank metric itself, imported from
+    diagnostics/probe_and_rank.py, in THIS file's import context; (b) confirm
+    the training loop still completes with the rank-snapshot logger wired in."""
+    print("[smoke] effective-rank metric validation (imported effective_rank_stats) ...")
+    from probe_and_rank import effective_rank_stats
+    rng = np.random.default_rng(0)
+    D = 256
+    # NOTE: a meaningful full-rank covariance estimate needs N > D; the task
+    # spec's illustrative N=64 example is rank-capped at min(N-1,D)=63 regardless
+    # of the true underlying structure, so validation here uses larger N (matching
+    # diagnostics/probe_and_rank.py's own smoke methodology) rather than the
+    # literal [64,256] figure, which cannot reach eff_rank~=256 for any input.
+    iso = rng.standard_normal((4096, D))
+    er_iso, _, _ = effective_rank_stats(iso)
+    print(f"  isotropic [4096,{D}] eff_rank = {er_iso:.2f}  (expect near {D})")
+    assert er_iso > 0.6 * D, er_iso
+
+    rank4 = rng.standard_normal((2000, 4)) @ rng.standard_normal((4, D))
+    er_r4, _, _ = effective_rank_stats(rank4)
+    print(f"  rank-4    [2000,{D}] eff_rank = {er_r4:.2f}  (expect near 4)")
+    assert er_r4 < 6.0, er_r4
+
+    print("[smoke] rank-logger integration: synthetic snapshot + one training step ...")
+    torch.manual_seed(0)
+    n_findings = 74
+    model = CombinedAE(n_findings, view_handling='flag').train()
+
+    fake_images = torch.randn(16, 3, 224, 224)
+    fake_views = torch.zeros(16, dtype=torch.long)
+    fake_labels = torch.zeros(16, n_findings)
+    fake_ds = torch.utils.data.TensorDataset(fake_images, fake_views, fake_labels)
+    fake_loader = torch.utils.data.DataLoader(fake_ds, batch_size=8, shuffle=False)
+    device = torch.device('cpu')
+
+    eff_rank, pr, top10, n = compute_rank_snapshot(model.encoder, fake_loader, device)
+    assert n == 16, n
+    assert np.isfinite(eff_rank) and np.isfinite(pr) and np.isfinite(top10)
+    assert model.encoder.training, "compute_rank_snapshot must restore train() after its no_grad eval pass"
+    print(f"  pre-step snapshot: eff_rank={eff_rank:.2f}  PR={pr:.2f}  top10={top10:.3f}  "
+          f"n={n}  (finite; encoder.training restored)")
+
+    mse = nn.MSELoss(); focal = FocalBCEWithLogits()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+    images = torch.randn(4, 3, 224, 224)
+    views = torch.randint(0, 2, (4,))
+    labels = (torch.rand(4, n_findings) > 0.7).float()
+    recon, logits, _ = model(images, views)
+    loss = 0.1 * mse(recon, images) + 1.0 * focal(logits, labels)
+    opt.zero_grad(); loss.backward(); opt.step()
+
+    eff_rank2, pr2, top10_2, n2 = compute_rank_snapshot(model.encoder, fake_loader, device)
+    assert np.isfinite(eff_rank2)
+    print(f"  post-step snapshot: eff_rank={eff_rank2:.2f}  (training loop + logger both ran, no crash)")
+    print("[smoke] rank logger PASS")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--init', default='artifacts/ae_encoder.pth', help='encoder warm-start ckpt')
@@ -278,10 +408,16 @@ def main():
     ap.add_argument('--weight_decay', type=float, default=5e-5)
     ap.add_argument('--num_workers', type=int, default=4)
     ap.add_argument('--device', default='cuda', choices=['cuda', 'cpu'])
+    ap.add_argument('--rank_log', default=None,
+                    help='Task 2: jsonl path for per-epoch effective-rank/PR/top10 snapshots. '
+                         'Off by default.')
+    ap.add_argument('--rank_eval_split', default='val', choices=['train', 'val', 'test'],
+                    help='Fixed split used for rank snapshots (same images every epoch).')
     ap.add_argument('--smoke', action='store_true')
     args = ap.parse_args()
     if args.smoke:
         smoke()
+        smoke_rank_logger()
         return
     train(args)
 
