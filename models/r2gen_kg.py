@@ -64,11 +64,26 @@ class R2GenKGModel(nn.Module):
         return output
 
     def classify_kg_nodes(self, images):
-        # Use fc_feats cached during the main forward() — avoids a second visual pass
+        # Reuse the fc_feats cached during the main forward() to skip a second
+        # visual pass -- BUT ONLY when that cache is connected to the CURRENT
+        # autograd graph. A cache left over from a no_grad / mode='sample'
+        # (validation) forward is DETACHED; reusing it while training would
+        # silently starve the visual extractor of gradients: the classifier and
+        # head would still update, so the loss curve looks healthy and the bug is
+        # invisible, yet the encoder never learns (any encoder retraining becomes
+        # a no-op). When grad is globally disabled (eval), the cache is safe.
+        # NOTE: the executed Stage-1 path (fresh model, no prior forward) and
+        # Stage-2 path (forward overwrites the cache each iter before this read)
+        # were already correct; this guard is defensive hardening for the
+        # encoder-retraining objective and is behaviour-preserving in both.
         cached = getattr(self, '_cached_fc_feats', None)
-        if cached is not None:
+        cache_usable = cached is not None and (cached.requires_grad or not torch.is_grad_enabled())
+        if cache_usable:
             return self.kg_classifier(cached)
-        # Fallback: rerun extractor (should not happen during normal training)
+        # Recompute fresh, in-graph. Do NOT cache the result here: in the Stage-1
+        # loop this method is called every iteration with no intervening
+        # forward(), and caching a tensor whose graph is freed by backward()
+        # would raise "backward through the graph a second time" next iteration.
         if self.args.dataset_name == 'iu_xray':
             _, fc_feats_0 = self.visual_extractor(images[:, 0])
             _, fc_feats_1 = self.visual_extractor(images[:, 1])

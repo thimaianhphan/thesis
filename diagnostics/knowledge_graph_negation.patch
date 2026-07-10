@@ -1,0 +1,75 @@
+diff --git a/modules/knowledge_graph.py b/modules/knowledge_graph.py
+index 761a7cb..32818ab 100644
+--- a/modules/knowledge_graph.py
++++ b/modules/knowledge_graph.py
+@@ -76,16 +76,30 @@ SYNONYM_MAP = {
+     'hyperinflated': 'hyperinflation',
+ }
+ 
++# --- Negation handling (opt-in via KnowledgeGraphBuilder(negation_aware=True)) --
++# Phase 0.1 diagnostic found ~71% of abnormal-node positive labels are negation
++# artifacts ("no pleural effusion" -> effusion=1). When negation_aware is enabled,
++# an abnormal entity that appears ONLY in a negated sentence context is dropped.
++# Anatomy / normal nodes are unaffected. Default is OFF to preserve behaviour.
++NEG_CUES = {'no', 'not', 'without', 'negative', 'free', 'resolved', 'absent',
++            'cleared'}
++SCOPE_TERMINATORS = {'but', 'however', 'although', 'though', 'otherwise',
++                     'except', 'with', 'shows', 'showing', 'demonstrates',
++                     'demonstrating', 'reveals', 'revealing', 'redemonstrated'}
++ABNORMAL_CANON = frozenset(SYNONYM_MAP.get(w, w) for w in FINDING_ENTITIES['abnormal'])
++
+ 
+ # =============================================================================
+ # 2. Knowledge Graph Construction
+ # =============================================================================
+ 
+ class KnowledgeGraphBuilder:
+-    def __init__(self, ann_path, dataset_name='iu_xray', co_occur_threshold=3):
++    def __init__(self, ann_path, dataset_name='iu_xray', co_occur_threshold=3,
++                 negation_aware=False):
+         self.ann_path = ann_path
+         self.dataset_name = dataset_name
+         self.co_occur_threshold = co_occur_threshold
++        self.negation_aware = negation_aware
+         self.all_finding_words = FINDING_ENTITIES['abnormal'] + FINDING_ENTITIES['normal']
+         self.all_entity_words = ANATOMY_ENTITIES + self.all_finding_words
+ 
+@@ -152,12 +166,36 @@ class KnowledgeGraphBuilder:
+         print(f"[KG] {N} nodes ({len(anat)} anat, {len(abnl)} abnl, {len(norm)} norm)")
+         return node_list, node_types, adj, node2idx
+ 
++    def _negated_abnormal(self, report_text):
++        """Sentence-scoped set of canonical abnormal entities appearing ONLY in a
++        negated context. A negation cue opens a scope over the coordinated list
++        ("no A, B, or C") until a contrast/assertion terminator."""
++        lower = report_text.lower()
++        negated = set()
++        for sent in re.split(r'[.;:]', lower):
++            toks = re.sub(r'[^a-z0-9 ]', ' ', sent).split()
++            canon = [SYNONYM_MAP.get(t, t) for t in toks]
++            postfix = bool(re.search(r'\bnot\b.*\b(seen|identified|present|appreciated|evident|noted)\b', sent))
++            flag = False
++            for i, t in enumerate(toks):
++                if t in SCOPE_TERMINATORS:
++                    flag = False
++                if t in NEG_CUES:
++                    flag = True
++                if canon[i] in ABNORMAL_CANON and (flag or postfix):
++                    negated.add(canon[i])
++        return negated
++
+     def extract_labels_for_report(self, report_text, node_list, node2idx):
+         entities = self._extract_entities(report_text)
++        negated = self._negated_abnormal(report_text) if self.negation_aware else set()
+         labels = np.zeros(len(node_list), dtype=np.float32)
+         for e in entities:
+-            if e in node2idx:
+-                labels[node2idx[e]] = 1.0
++            if e not in node2idx:
++                continue
++            if self.negation_aware and e in ABNORMAL_CANON and e in negated:
++                continue  # spurious: abnormal finding word appears only negated
++            labels[node2idx[e]] = 1.0
+         return labels
+ 
+ 
